@@ -14,13 +14,15 @@ from genomepy import config
 
 def define_arguments():
     parser = argparse.ArgumentParser(description=
-            "Performs set analysis on multiple lists and outputs venn diagrams.")
+            "Performs file modifications on gff and fasta files.")
 
     # input options
     parser.add_argument("-g", "--gff", type=str,
                         help="specify the gff file to use")
     parser.add_argument("-f", "--fasta", type=str,
                         help="specify the fasta file to use")
+    parser.add_argument("-c", "--column", type=int, default=0,
+                        help = "the column in which to convert names")
     parser.add_argument("-q", "--quiet", action='store_true',default=False,
                         help="don't print messages")
     parser.add_argument("-k", "--speckey", type=str, default="",
@@ -38,54 +40,68 @@ def define_arguments():
     parser.add_argument("-R", "--replace", action='store_true',
                         help="replace isoforms in fasta def line with genes from gff file")
     parser.add_argument("-M", "--replace_all", action='store_true',
-                        help="replace isoforms in 'fasta' columns with genes from gff file")
+                        help="replace isoforms in specified column (use --column and --fasta) with genes from gff file")
     parser.add_argument("-b", "--large_term", type=str, default='gene',
                         help = "the term to replace to")
     parser.add_argument("-s", "--small_term", type=str, default='protein_id',
                         help = "the term to replace from")
+    parser.add_argument("-a", "--addname", type=str, default='gene',
+                        help = "In the specified gff file, replace the largeterm in specified level with the small term")
 
 
 
     return parser
 
-def build_isodic(gff, idbig='gene', idsmall='protein_id'):
+def build_isodic(gff, idbig='gene', idsmall='protein_id', reverse=True):
     handle = open(gff, 'rb')
     genedic = {}
     for line in handle:
         attributes = attr(line)
-        genedic = update_genedic(genedic, attributes, True, idbig=idbig, idsmall=idsmall)
+        genedic = update_genedic(genedic, attributes, reverse=reverse, idbig=idbig, idsmall=idsmall)
     handle.close()
     return genedic
 
-def replace_all(isodic, fasta, outfile, speckey):
-    handle = open(fasta, 'rb')
+def col_counter(columns,column):
+    if column:
+        yield columns[column]
+    else:
+        for col in columns:
+            yield col
+
+def replace_all(isodic, filename, outfile, prefix, column=None):
+    """
+    search for gene ids in the specified columns (if none, will search all columns)
+
+
+
+    """
+    handle = open(filename, 'rb')
     outhandle = open(outfile, 'w')
 
     for line in handle:
         # check the line has the species prefix:
         columns = line.split()
-        specheck = [ re.search(speckey, col) for col in columns]
-        pattern = speckey + "\|?([\S]+)"
+        prefix_check = [ re.search(prefix, col) for col in columns]
+        pattern = prefix + "\|?([\S]+)"
         isocheck = None
-        if specheck[0]:
-            isocheck = re.search(pattern, columns[0])
-            col = 0
-        elif  specheck[1]:
-            isocheck = re.search(pattern, columns[1])
-            col = 1
 
-        if isocheck:
-            if isocheck.group(1) in isodic:
-                columns[col] = speckey + "|" + isodic[isocheck.group(1)][0]
-                try:
-                    outhandle.write("%s\n" % ("\t".join(columns)))
-                except TypeError:
-                    verbalise("R", columns)
-                    exit()
-            else:
-                outhandle.write(line)
-        else:
-            outhandle.write(line)
+        valid_columns = col_counter(columns, column)
+        for col, contents in enumerate(valid_columns):
+            if prefix_check[col]:
+                isocheck = re.search(pattern, columns[col])
+
+                if isocheck:
+                    if isocheck.group(1) in isodic:
+                        columns[col] = prefix + "|" + isodic[isocheck.group(1)][0]
+        try:
+            outhandle.write("%s\n" % ("\t".join(columns)))
+        except TypeError:
+            verbalise("R", columns)
+            exit()
+        #            else:
+        #                outhandle.write(line)
+        #        else:
+        #            outhandle.write(line)
 
 def replace_fasta(isodic, fasta, outfile):
     handle = open(fasta, 'rb')
@@ -174,6 +190,8 @@ def findlongest(gff, pepfile):
     longest_h.close()
 
 def attr(line):
+    if len(line) == 0:
+        return None
     if line[0] == '#':
         return None
     cols = line.split()
@@ -222,13 +240,17 @@ def convert_gff(gff, outfile):
                 if attributes['gbkey'] == 'exon':
                     pass
                 elif attributes['gbkey'] == 'tRNA':
-                    outhandle.write('%s\tgene_id "%s";\ttranscript_id "%s"; id "%s";\n' % (
-                                "\t".join(line.split()[:8]),
-                                attributes['gene'],
-                                attributes['Dbxref'],
-                                attributes['ID'])
-                            )
-                    writecount += 1
+                    try:
+                        outhandle.write('%s\tgene_id "%s";\ttranscript_id "%s"; id "%s";\n' % (
+                                    "\t".join(line.split()[:8]),
+                                    attributes['gene'],
+                                    attributes['Dbxref'],
+                                    attributes['ID'])
+                                )
+                    except:
+                        print line
+                    else:
+                        writecount += 1
                 else:
                     verbalise("R", "KeyError for %s:\n" % (ke), attributes)
             else:
@@ -236,6 +258,46 @@ def convert_gff(gff, outfile):
     outhandle.close()
     handle.close()
     return exoncount, writecount
+
+def replace_gff(isodic, gff_file, outfile,
+                    level='gene', idbig='gene', idsmall='product'):
+
+    "replaces idbig name in level with idsmall"
+    handle = open(gff_file, 'rb')
+    outhandle = open(outfile, 'w')
+
+    foundidbig = []
+
+    for line in handle:
+        cols = line.split()
+        if cols[2] == level:
+            atts = attr(line)
+            if idbig in atts:
+                if atts[idbig] in isodic:
+                    atts[idbig] = isodic[atts[idbig]][0]
+                    try:
+                        cols[8] = ";".join([ k + "=" + v for k,v in atts.items() ])
+                    except TypeError:
+                        verbalise("R", atts.items())
+                elif 'pseudo' in atts:
+                    atts[idbig] = "pseudo_" + atts[idbig]
+                    try:
+                        cols[8] = ";".join([ k + "=" + v for k,v in atts.items() ])
+                    except TypeError:
+                        verbalise("R", atts.items())
+                else:
+                    foundidbig.append(atts[idbig])
+            else:
+                cols[8] = " ".join(cols[8:])
+        else:
+            cols[8] = " ".join(cols[8:])
+        outhandle.write("\t".join(cols[:9]) + "\n")
+    handle.close()
+    outhandle.close()
+
+    if len(foundidbig) > 0:
+        verbalise("R", "%d genes were not converted! (%s...)" % (len(foundidbig),",".join(foundidbig[:3])))
+
 
 if __name__ == '__main__':
     parser = define_arguments()
@@ -264,7 +326,7 @@ if __name__ == '__main__':
         verbalise("G", "%d isoforms added" % (len(isodic)))
         egkeys = " : ".join(isodic.keys()[:5])
         egvals = " : ".join([str(val) for val in isodic.values()[:5]])
-        verbalise("Y", "%s\n%s" % (egkeys, egvals) )
+        verbalise("B", "%s\n%s" % (egkeys, egvals) )
         verbalise("writing new file")
         replace_fasta(isodic, args.fasta, logfile[:-3]+'out')
     elif args.replace_all:
@@ -273,6 +335,17 @@ if __name__ == '__main__':
         verbalise("G", "%d isoforms added" % (len(isodic)))
         egkeys = " : ".join(isodic.keys()[:5])
         egvals = " : ".join([str(val) for val in isodic.values()[:5]])
-        verbalise("Y", "%s\n%s" % (egkeys, egvals) )
+        verbalise("B", "%s\n%s" % (egkeys, egvals) )
         verbalise("writing new file")
         replace_all(isodic, args.fasta, logfile[:-3]+'out', args.speckey)
+    elif args.addname:
+        verbalise("building isoform dictionary")
+        isodic = build_isodic(args.gff, idbig=args.large_term, idsmall=args.small_term,
+                                reverse=False)
+        verbalise("G", "%d isoforms added" % (len(isodic)))
+        egkeys = " : ".join(isodic.keys()[:5])
+        egvals = " : ".join([str(val) for val in isodic.values()[:5]])
+        verbalise("B", "%s\n%s" % (egkeys, egvals) )
+        replace_gff(isodic, args.gff, logfile[:-3]+'out',
+                    idbig=args.large_term, idsmall=args.small_term,
+                    level=args.addname)
