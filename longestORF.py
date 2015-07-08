@@ -22,7 +22,7 @@ def define_arguments():
     parser.add_argument("-f", "--fasta", type=str,
                         help="specify the fasta file to use")
     parser.add_argument("-c", "--column", type=int, default=0,
-                        help = "the column in which to convert names")
+                        help = "the column in which to convert names. (default=0)")
     parser.add_argument("-q", "--quiet", action='store_true',default=False,
                         help="don't print messages")
     parser.add_argument("-k", "--speckey", type=str, default="",
@@ -42,9 +42,9 @@ def define_arguments():
     parser.add_argument("-M", "--replace_all", action='store_true',
                         help="replace isoforms in specified column (use --column and --fasta) with genes from gff file")
     parser.add_argument("-b", "--large_term", type=str, default='gene',
-                        help = "the term to replace to")
+                        help = "the term to replace to. (Default='gene')")
     parser.add_argument("-s", "--small_term", type=str, default='protein_id',
-                        help = "the term to replace from")
+                        help = "the term to replace from. (Default='protein_id'")
     parser.add_argument("-a", "--addname", type=str, default='gene',
                         help = "In the specified gff file, replace the largeterm in specified level with the small term")
 
