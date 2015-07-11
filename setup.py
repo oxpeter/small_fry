@@ -2,13 +2,13 @@
 
 from distutils.core import setup
 
-setup(name='ortho',
+setup(name='small_fry',
       version='0.5',
       description='miscellany of python packages for all and sundry analyses',
       author='Peter Oxley',
       author_email='oxpeter+git@gmail.com',
       url='https://oxpeter@bitbucket.org/oxpeter/ortho.git',
-      package_data={'genomepy': ['data/*.cfg'], 'genomepy': ['data/README']},
+      package_data={'': ['data/*.txt'], '': ['data/*.gff']},
       py_modules=[  'blastfaster', 'brain_machine', 'degrees',
                     'kegg', 'longestORF',
                     'plate_analysis', 'textmod',
