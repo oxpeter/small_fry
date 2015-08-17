@@ -15,22 +15,27 @@ from genomepy import config
 def define_arguments():
     parser = argparse.ArgumentParser(description=
             "Performs file modifications on gff and fasta files.")
+    # logging options
+    parser.add_argument("-o", "--output", type=str, default='lorf2.out',
+                        help="specify the filename to save results to")
+    parser.add_argument("-d", "--directory", type=str,
+                        help="specify the directory to save results to")
 
     # input options
     parser.add_argument("-g", "--gff", type=str,
                         help="specify the gff file to use")
     parser.add_argument("-f", "--fasta", type=str,
                         help="specify the fasta file to use")
+
+    # analysis options
+    parser.add_argument("-p", "--pattern", type=str, default='(gb|ref)\|([^\|]+)\|',
+                        help="specify the regex to locate peptide name")
     parser.add_argument("-c", "--column", type=int, default=0,
                         help = "the column in which to convert names. (default=0)")
     parser.add_argument("-q", "--quiet", action='store_true',default=False,
                         help="don't print messages")
     parser.add_argument("-k", "--speckey", type=str, default="",
                         help="specify the species prefix")
-    parser.add_argument("-o", "--output", type=str, default='lorf2.out',
-                        help="specify the filename to save results to")
-    parser.add_argument("-d", "--directory", type=str,
-                        help="specify the directory to save results to")
     parser.add_argument("-L", "--find_longest", action='store_true',
                         help="find longest peptide isoform for each gene in specified gff")
     parser.add_argument("-C", "--convert", action='store_true',
@@ -46,7 +51,8 @@ def define_arguments():
     parser.add_argument("-s", "--small_term", type=str, default='protein_id',
                         help = "the term to replace from. (Default='protein_id'")
     parser.add_argument("-a", "--addname", type=str, default='gene',
-                        help = "In the specified gff file, replace the largeterm in specified level with the small term")
+                        help = """In the specified gff file, replace the large term in
+                        the specified level with the small term""")
 
 
 
@@ -120,8 +126,10 @@ def replace_fasta(isodic, fasta, outfile):
     outhandle.close()
     handle.close()
 
-def findlongest(gff, pepfile):
+def findlongest(gff, pepfile, species_key, pattern='(gb|ref)\|([^\|]+)\|'):
+    print "Searching using pattern %r" % pattern
     isolen = {}
+    err_cnt = 0
 
     gff_h = open(gff, 'rb')
     for line in gff_h:
@@ -131,15 +139,23 @@ def findlongest(gff, pepfile):
             cdstart = int(line.split()[3])
             cdstop = int(line.split()[4])
             attr = { term.split('=')[0]:term.split('=')[1] for term in " ".join(line.split()[8:]).split(';')  }
-            try:
+            
+            if 'gene' in attr:
                 gene = attr['gene']
-                mrna = attr['protein_id']
-            except KeyError:
-                if re.search('RNA|CDS|gene',line.split()[2]):
-                    print line
-                    print attr
-                    print "-----"
+            elif 'Name' in attr:
+                gene = attr['Name']
+            else:
+                err_cnt += 1
                 continue
+            
+            if 'protein_id' in attr:
+                mrna = attr['protein_id']
+            elif 'transcript_id' in attr:
+                mrna = attr['transcript_id']
+            else:
+                err_cnt += 1
+                continue
+            
             if gene not in isolen:
                 isolen[gene] = { mrna:abs(cdstart-cdstop) }
             elif mrna not in isolen[gene]:
@@ -147,21 +163,25 @@ def findlongest(gff, pepfile):
             else:
                 isolen[gene][mrna] += abs(cdstart-cdstop)
 
+    if err_cnt > 0:
+        verbalise("R", err_cnt, "CDS lines could not be parsed.")
     gff_h.close()
-
+    verbalise("G", "%d genes parsed successfully" % len(isolen))
+    print isolen.keys()[0], isolen[isolen.keys()[0]]
 
     # load peptide sequences:
-    print "Loading all peptide sequences."
+    verbalise("B", "Loading all peptide sequences.")
 
     pep_h = open(pepfile, 'rb')
     pepseq = {}
     peptide = 'Should not be here'
     for line in pep_h:
         if line[0] == '>':
+            # identify peptide name: default is NCBI format >gi|328776094|ref|XP_001122629.2| PRED..
             try:
-                peptide = re.search('(gb|ref)\|([^\|]+)\|', line).group(2)
+                peptide = re.search(pattern, line).group(2)
             except AttributeError:
-                print line
+                print line.strip()
                 peptide = "error"
             if peptide == None:
                 print line
@@ -169,17 +189,18 @@ def findlongest(gff, pepfile):
             pepseq[peptide] = ""
         else:
             pepseq[peptide] += line.strip()
-
-
+    pep_h.close()
+    verbalise("G", "%d peptide sequences successfully extracted" % len(pepseq))
+    print pepseq.keys()[:5]
 
     # write longest peptide sequences to fasta file:
-    longest = gff[:-3]+"longest.pep"
-    print "writing longests sequences to ", longest
+    longest = gff[:-4]+"longest.pep"
+    verbalise("Y", "writing longests sequences to ", longest)
     longest_h = open(longest, 'w')
     for gene in isolen:
         for isoform in isolen[gene]:
             if isolen[gene][isoform] == max(isolen[gene].values()):
-                longest_h.write(">Cbir|%s\n" % (isoform))
+                longest_h.write(">%s|%s\n" % (species_key, isoform))
                 try:
                     longest_h.write(pepseq[isoform] + "\n")
                 except KeyError:
@@ -319,7 +340,7 @@ if __name__ == '__main__':
         verbalise( len(genedic), genedic.keys()[:5], genedic.values()[:5] )
         verbalise( sum( 1 for val in genedic if len(genedic[val]) > 1) )
     elif args.find_longest:
-        findlongest(args.gff, logfile[:-3]+'out')
+        findlongest(args.gff, args.fasta, args.speckey, pattern=args.pattern)
     elif args.replace:
         verbalise("building isoform dictionary")
         isodic = build_isodic(args.gff, idbig=args.large_term, idsmall=args.small_term)
