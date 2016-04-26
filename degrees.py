@@ -4,11 +4,13 @@
 This script compares the significant and non-significant genes between two experiments
 and shows how many are concordant/non-concordant etc.
 """
-import os
-import sys
-import re
+
 import argparse
+import collections
 import itertools
+import os
+import re
+import sys
 
 import pandas as pd
 import numpy as np
@@ -30,7 +32,17 @@ def define_arguments():
     # input options
     parser.add_argument("experiments", metavar='filename', nargs='*', type=str,
                         help="a data file for comparing")
-
+    parser.add_argument("orthologs", nargs=1, type=str,
+                        help="orthomcl-formatted ortholog file")
+    
+    parser.add_argument("-m", "--mustcontain", type=str,
+                        help="""comma-separated list containing 4-letter species codes
+                        that must be present in each set of orthologs to include that set
+                        """)
+    parser.add_argument("-x", "--exclude", type=str,
+                        help="""comma-separated list containing 4-letter species codes
+                        that will be ignored in determining unique orthologous groups
+                        """)
     parser.add_argument("-f", "--first", type=str,
                         help="specify the first DESeq2 P-value output file to use")
     parser.add_argument("-s", "--second", type=str,
@@ -46,27 +58,80 @@ def define_arguments():
                         help="show charts and graphs")
 
 
-    parser.add_argument("-L", "--list_genes", type=str,
-                        help="list common significant genes. (provide a file for name expansion")
+    parser.add_argument("-L", "--list_genes", action='store_true',
+                        help="""list common significant genes. (provide a file for name 
+                        expansion""")
     parser.add_argument("-A", "--findall", action='store_true',
-                        help="find all significant concordant genes between given datasets")
+                        help="""find all significant concordant genes between given 
+                        datasets""")
     parser.add_argument("-R", "--reversepolarity", action='store_true',
                         help="reverse the polarity of log fold change for second set")
-    parser.add_argument("-O", "--orthologs", type=str,
-                        help="convert second list to orthologs from specified file")
 
     return parser
 
-def fetch_orthologs(args):
-    handle = open(args.orthologs, 'rb')
-    ortho_dic = { line.split()[0] : line.split()[1] for line in handle}
+
+
+def fetch_orthologs(orthofile, mustcontain=None, exclude=None):
+    handle = open(orthofile, 'rb')
+    verbalise("M", "Converting from file", orthofile)
+    ortho_dic = {}
+    for line in handle:
+        cols = line.split()
+        if len(cols) > 0:
+            counts = collections.Counter()
+            for g in cols:
+                spec = g.split('|')[0]
+                if spec in exclude:
+                    continue
+                else:
+                    counts[spec] += 1
+            if mustcontain:
+                whitelist = mustcontain
+            else:
+                whitelist = counts.keys()
+            
+            # add only if all species present only once
+            # and only if all necessary species are present
+            if ( all(  c <= 1 for c in counts.values()) and 
+                 all( wl in counts.keys() for wl in whitelist )
+               ):
+               
+                ortho_dic.update({ g:cols[0] for g in cols })
+    handle.close()        
+                
+    return ortho_dic
+
+def translate_to_orthologs(degfile, orthodic):
+    degdic = {}
+    handle = open(degfile, 'rb')
+    for line in handle:
+        cols = line.split()
+        if len(cols) == 7 and cols[0] != "baseMean":
+            if cols[0] in orthodic:
+                try:
+                    padj = float(cols[6])
+                except ValueError:
+                    if cols[5] == "NA":
+                        padj = 1
+                    elif float(cols[5]) < 0.05:
+                        padj = 0.05
+                    else:
+                        padj = 1
+                try:
+                    logfc = float(cols[2])
+                except ValueError:
+                    logfc = 0
+                degdic[orthodic[cols[0]]] = padj, logfc
     handle.close()
 
-    return ortho_dic
+    df = pd.DataFrame([ [k, v[0], v[1]] for k,v in degdic.items() ], 
+                        columns=["gene","padj","logfc"])
+    indexed_df = df.set_index('gene')
+    return indexed_df
 
 def replace_genenames(args):
     "Uses dictionary to replace and print only rows whose first column contains a match"
-    ortho_dic = fetch_orthologs(args)
+    ortho_dic = fetch_orthologs(args.orthologs)
     handle = open(args.second, 'rb')
 
     newfile = args.second[:-3] + 'ortho.out'
@@ -244,6 +309,7 @@ def compare_two(args, logfile):
                 bkgd_freq=concordance_sets[-1], label1=label1, label2=label2,
                 outfile=logfile[:-3] + "chart.pdf", visible=args.visible )
 
+    return df1_sp & df2_sp, df1_sn & df2_sn
 
 def draw_circles(c1t,c2t,c3t,c4t,o1t,o2t,o3t,o4t,l1t,l2t,l3t,l4t, outfile="venn.jpg", visible=False):
     # define colors:
@@ -355,61 +421,125 @@ if __name__ == '__main__':
     verbalise = config.check_verbose(not(args.quiet))
     logfile = config.create_log(args, outdir=args.directory, outname=args.output)
 
-    if args.orthologs:
-        args = replace_genenames(args)
-        verbalise("Y", "Ortholog file saved to %s" % os.path.basename(args.second))
+    stop = False
+    for f in args.experiments:
+        if not os.path.isfile(f):
+            verbalise("R", "%s could not be found" % (f))
+            stop = True
+    if stop:
+        exit() 
 
+    if args.exclude:
+        exclusions = args.exclude.split(',')
+    else:
+        exclusions = None
+        
+    if args.mustcontain:
+        necessary = args.mustcontain.split(',')
+    else:
+        necessary = None
+
+    #args = replace_genenames(args)
+    #verbalise("Y", "Ortholog file saved to %s" % os.path.basename(args.second))
+    print "Ortholog file must contain:", args.mustcontain
+    orthodic = fetch_orthologs(args.orthologs[0], 
+                                mustcontain=necessary, 
+                                exclude=exclusions)
+    verbalise("G", "%d unique ortholog groups were found" % len(orthodic.items()))
+    
+    
     if args.first and args.second:
-        compare_two(args, logfile)
-
+        # returns the genes that are significant and concordant in pos and neg directions:
+        pcs, ncs = compare_two(args, logfile)
+        common_to_all = pcs | ncs
+    
     if args.experiments:
+
+        # initialise containers:        
+        concordant_array = pd.DataFrame(
+                None,
+                index=[os.path.basename(e)[:5] for e in args.experiments],
+                columns=[os.path.basename(e)[:5] for e in args.experiments]
+                )
         concordant_sig_genesets = []
+
+        # do all pairwise comparisons:
         for (exp1, exp2) in itertools.product(args.experiments, args.experiments):
             # itertools.product produces an all-by-all comparison of the two lists
             # because this will include the same file compared to itself, we need
             # to remove those cases (which would mess up our comparisons):
             if exp1 == exp2:
                 continue
-
-            df1 = pd.read_csv(exp1, sep=" ", header=0)
-            df2 = pd.read_csv(exp2, sep=" ", header=0)
-            df3 = df1.join(df2, lsuffix="1st").dropna()
-
+            
+            # get dataframes containing orthologs
+            df1 = translate_to_orthologs(exp1, orthodic)
+            df2 = translate_to_orthologs(exp2, orthodic)
+            
+            
+            # the ratio of positive to negative log fold changes in a sample are 
+            # probably consistent across species. So looking for a ratio gt or lt 1 in the
+            # first sample, then convert all remaining samples to match, should give the
+            # greatest concordance, and represent equivalent experimental conditions
+            p1 = df1[df1.logfc > 0].count()["logfc"]
+            n1 = df1[df1.logfc < 0].count()["logfc"]
+            r1 = 1. * p1 / (n1 + 1)
+            if r1 < 1:
+                df1.logfc = df1.logfc * -1
+            
+            p2 = df2[df2.logfc > 0].count()["logfc"]
+            n2 = df2[df2.logfc < 0].count()["logfc"]
+            r2 = 1. * p2 / (n2 + 1)
+            if r2 < 1:
+                df1.logfc = df1.logfc * -1
+            
+                        
+            df3 = df1.join(df2, how='left', lsuffix="1st").dropna()            
             label1 = os.path.basename(exp1)[:5]
             label2 = os.path.basename(exp2)[:5]
 
             # get genes that are significant in both experiements and their direction:
-            df1_sp = set(df3[(df3.padj1st<=0.05) & (df3.log2FoldChange1st>0)].index)
-            df2_sp = set(df3[(df3.padj<=0.05) & (df3.log2FoldChange>0)].index)
-            df1_sn = set(df3[(df3.padj1st<=0.05) & (df3.log2FoldChange1st<0)].index)
-            df2_sn = set(df3[(df3.padj<=0.05) & (df3.log2FoldChange<0)].index)
+            df1_sp = set(df3[(df3.padj1st<=0.05) & (df3.logfc1st>0)].index)
+            df2_sp = set(df3[(df3.padj   <=0.05) & (df3.logfc   >0)].index)
+            df1_sn = set(df3[(df3.padj1st<=0.05) & (df3.logfc1st<0)].index)
+            df2_sn = set(df3[(df3.padj   <=0.05) & (df3.logfc   <0)].index)
 
-            df1_nsp = set(df3[(df3.padj1st>0.05) & (df3.log2FoldChange1st>0)].index)
-            df2_nsp = set(df3[(df3.padj>0.05) & (df3.log2FoldChange>0)].index)
-            df1_nsn = set(df3[(df3.padj1st>0.05) & (df3.log2FoldChange1st<0)].index)
-            df2_nsn = set(df3[(df3.padj>0.05) & (df3.log2FoldChange<0)].index)
+            df1_nsp = set(df3[(df3.padj1st>0.05) & (df3.logfc1st>0)].index)
+            df2_nsp = set(df3[(df3.padj   >0.05) & (df3.logfc   >0)].index)
+            df1_nsn = set(df3[(df3.padj1st>0.05) & (df3.logfc1st<0)].index)
+            df2_nsn = set(df3[(df3.padj   >0.05) & (df3.logfc   <0)].index)
 
-            print label1, "vs", label2, ":"
-            verbalise("G", label1, "pos", len(df1_sp))
-            verbalise("G", label1, "neg", len(df1_sn))
-            verbalise("G", label1, "both", len(df1_sp | df1_sn))
-            verbalise("C", label2, "pos", len(df2_sp))
-            verbalise("C", label2, "neg", len(df2_sn))
-            verbalise("C", label2, "both", len(df2_sp | df2_sn))
+            verbalise(
+                    "B", 
+                    "\n\n%s (%d orthologs) vs %s (%d orthologs) : %d shared orthologs" % (
+                         label1, len(df1), label2, len(df2), len(df3))
+                      )
+            verbalise("G", "%s: %d significant and pos" % (label1, len(df1_sp)))
+            verbalise("G", "%s: %d significant and neg" % (label1, len(df1_sn)))
+            verbalise("G", "%s: %d all significant    " % (label1, len(df1_sp | df1_sn)))
+            verbalise("C", "%s: %d significant and pos" % (label2, len(df2_sp)))
+            verbalise("C", "%s: %d significant and neg" % (label2, len(df2_sn)))
+            verbalise("C", "%s: %d all significant    " % (label2, len(df2_sp | df2_sn)))
 
             concordance_sets = concordancecounts(df1_sp, df2_sp, df1_sn, df2_sn,
                               df1_nsp, df2_nsp, df1_nsn, df2_nsn)
 
             concordant_sig_genesets.append(concordance_sets[0])
 
+            concordant_array[label1].loc[label2] = len(concordance_sets[0])
             verbalise("Y", "concordant DEGs = ", len(concordance_sets[0]))
 
         common_to_all = set.intersection(*concordant_sig_genesets)
-        verbalise("R", "There are %d genes common to all datasets" % len(common_to_all))
+        verbalise("R", "\nThere are %d genes common to all datasets" % len(common_to_all))
 
-        if args.list_genes:
-            ncbi = bm.ncbi_dic(args.list_genes)
-            genelist = open(logfile[:-3] + "concordantgenes.list", 'w')
-            genelist.write("\n".join([bm.show_name(loc, ncbi) for loc in common_to_all]))
-            genelist.close()
-            print "\n".join([bm.show_name(loc, ncbi) for loc in common_to_all])
+        print concordant_array
+        
+    if args.list_genes:
+        """
+        ncbi = bm.ncbi_dic(args.list_genes)
+        genelist = open(logfile[:-3] + "concordantgenes.list", 'w')
+        genelist.write("\n".join([bm.show_name(loc, ncbi) for loc in common_to_all]))
+        genelist.close()
+        print "\n".join([bm.show_name(loc, ncbi) for loc in common_to_all])
+        """
+        for o in common_to_all:
+            verbalise("Y", o)
