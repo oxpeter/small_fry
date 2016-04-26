@@ -130,30 +130,6 @@ def translate_to_orthologs(degfile, orthodic):
     indexed_df = df.set_index('gene')
     return indexed_df
 
-def replace_genenames(args):
-    "Uses dictionary to replace and print only rows whose first column contains a match"
-    ortho_dic = fetch_orthologs(args.orthologs)
-    handle = open(args.second, 'rb')
-
-    newfile = args.second[:-3] + 'ortho.out'
-    while os.path.isfile(newfile): # make sure I'm not overwriting another file!
-        newfile = newfile[:-4] + '1.out'
-    orthofile = open( newfile, 'w')
-    orthofile.write("baseMean log2FoldChange lfcSE stat pvalue padj\n")
-
-    for line in handle:
-        cols = line.split()
-        if cols[0] in ortho_dic:
-            cols[0] = ortho_dic[cols[0]]
-            orthofile.write(" ".join(cols) + "\n")
-    handle.close()
-    orthofile.close()
-
-    # update arg class so all downstream analyses use the newly created file:
-    args.second = newfile
-
-    return args
-
 def sigcounts(pos1, pos2, neg1, neg2):
     # get overlapping sets:
     concord_p = pos1 & pos2
@@ -250,63 +226,6 @@ def draw_graph( con_sig1, con_nsig1, ncon_sig1, ncon_nsig1,
     else:
         plt.close()
 
-
-def compare_two(args, logfile):
-    df1 = pd.read_csv(args.first, sep=" ", header=0)
-    df2 = pd.read_csv(args.second, sep=" ", header=0)
-    df3 = df1.join(df2, lsuffix="1st").dropna()
-
-    if len(df3.index)==0:
-        verbalise("R", "No genes found in common between the two samples. If comparing different species, please make sure that you are using orthologous gene names")
-
-
-    label1 = os.path.basename(args.first)[:5]
-    label2 = os.path.basename(args.second)[:5]
-
-    # get genes that are significant in both experiements and their direction:
-    df1_sp = set(df3[(df3.padj1st<=0.05) & (df3.log2FoldChange1st>0)].index)
-    df1_sn = set(df3[(df3.padj1st<=0.05) & (df3.log2FoldChange1st<0)].index)
-    df1_nsp = set(df3[(df3.padj1st>0.05) & (df3.log2FoldChange1st>0)].index)
-    df1_nsn = set(df3[(df3.padj1st>0.05) & (df3.log2FoldChange1st<0)].index)
-
-    if not args.reversepolarity:
-        df2_sp = set(df3[(df3.padj<=0.05) & (df3.log2FoldChange>0)].index)
-        df2_sn = set(df3[(df3.padj<=0.05) & (df3.log2FoldChange<0)].index)
-        df2_nsp = set(df3[(df3.padj>0.05) & (df3.log2FoldChange>0)].index)
-        df2_nsn = set(df3[(df3.padj>0.05) & (df3.log2FoldChange<0)].index)
-    else:
-        df2_sp = set(df3[(df3.padj<=0.05) & (df3.log2FoldChange<0)].index)
-        df2_sn = set(df3[(df3.padj<=0.05) & (df3.log2FoldChange>0)].index)
-        df2_nsp = set(df3[(df3.padj>0.05) & (df3.log2FoldChange<0)].index)
-        df2_nsn = set(df3[(df3.padj>0.05) & (df3.log2FoldChange>0)].index)
-
-
-    print "DATAFRAMES:"
-    verbalise("G", label1, "pos", len(df1_sp))
-    verbalise("G", label1, "neg", len(df1_sn))
-    verbalise("G", label1, "both", len(df1_sp | df1_sn))
-    verbalise("C", label2, "pos", len(df2_sp))
-    verbalise("C", label2, "neg", len(df2_sn))
-    verbalise("C", label2, "both", len(df2_sp | df2_sn))
-
-    print "CIRCLES"
-    pos1_u,pos2_u,neg2_u,neg1_u,concord_p,discord_2p,concord_n,discord_1p = sigcounts(df1_sp, df2_sp, df1_sn, df2_sn)
-
-    draw_circles(pos1_u,pos2_u,neg2_u,neg1_u,concord_p,discord_2p,concord_n,discord_1p,
-                label1+" pos", label2+" pos", label1+" neg", label2+" neg",
-                outfile=logfile[:-3] + "venn.png", visible=args.visible  )
-
-    print "CONCORDANCE CHARTS"
-    concordance_sets = concordancecounts(df1_sp, df2_sp, df1_sn, df2_sn,
-                              df1_nsp, df2_nsp, df1_nsn, df2_nsn)
-
-
-    draw_graph( *[len(s) for s in concordance_sets[:-1]],
-                bkgd_freq=concordance_sets[-1], label1=label1, label2=label2,
-                outfile=logfile[:-3] + "chart.pdf", visible=args.visible )
-
-    return df1_sp & df2_sp, df1_sn & df2_sn
-
 def draw_circles(c1t,c2t,c3t,c4t,o1t,o2t,o3t,o4t,l1t,l2t,l3t,l4t, outfile="venn.jpg", visible=False):
     # define colors:
     burgundy =  (149,55,53)
@@ -379,7 +298,7 @@ if __name__ == '__main__':
             verbalise("R", "%s could not be found" % (f))
             stop = True
     if stop:
-        exit()
+        sys.exit(1)
 
     if args.exclude:
         exclusions = args.exclude.split(',')
@@ -391,9 +310,7 @@ if __name__ == '__main__':
     else:
         necessary = None
 
-    #args = replace_genenames(args)
-    #verbalise("Y", "Ortholog file saved to %s" % os.path.basename(args.second))
-    print "Ortholog file must contain:", args.mustcontain
+    print "\nOrtholog file must contain:", args.mustcontain
     orthodic = fetch_orthologs(args.orthologs[0],
                                 mustcontain=necessary,
                                 exclude=exclusions)
