@@ -47,7 +47,10 @@ def define_arguments():
                         help="specify the first DESeq2 P-value output file to use")
     parser.add_argument("-s", "--second", type=str,
                         help="specify the second DESeq2 P-value output file to use")
-
+    parser.add_argument('-c', '--calibrate', type=str,
+                        help="""provide an ortholog group name that is differentially
+                        expressed in the same direction in all experiments, to ensure
+                        that all directionality is consisent across experiments.""")
     parser.add_argument("-q", "--quiet", action='store_true',default=False,
                         help="don't print messages")
     parser.add_argument("-o", "--output", type=str, default='lorf2.out',
@@ -480,22 +483,29 @@ if __name__ == '__main__':
             # probably consistent across species. So looking for a ratio gt or lt 1 in the
             # first sample, then convert all remaining samples to match, should give the
             # greatest concordance, and represent equivalent experimental conditions
-            p1 = df1[df1.logfc > 0].count()["logfc"]
-            n1 = df1[df1.logfc < 0].count()["logfc"]
+            p1 = df1[(df1.logfc > 0) & (df1.padj <= 0.05)].count()["logfc"]
+            n1 = df1[(df1.logfc < 0) & (df1.padj <= 0.05)].count()["logfc"]
             r1 = 1. * p1 / (n1 + 1)
-            if r1 < 1:
+            if args.calibrate and df1['logfc'].loc[args.calibrate] < 0:
                 df1.logfc = df1.logfc * -1
             
-            p2 = df2[df2.logfc > 0].count()["logfc"]
-            n2 = df2[df2.logfc < 0].count()["logfc"]
+            #if r1 < 1:
+            #    df1.logfc = df1.logfc * -1
+            
+            p2 = df2[(df2.logfc > 0) & (df2.padj <= 0.05)].count()["logfc"]
+            n2 = df2[(df2.logfc < 0) & (df2.padj <= 0.05)].count()["logfc"]
             r2 = 1. * p2 / (n2 + 1)
-            if r2 < 1:
-                df1.logfc = df1.logfc * -1
+            if args.calibrate and df2['logfc'].loc[args.calibrate] < 0:
+                df2.logfc = df2.logfc * -1
+            #if r2 < 1:
+            #    df1.logfc = df1.logfc * -1
             
                         
             df3 = df1.join(df2, how='left', lsuffix="1st").dropna()            
             label1 = os.path.basename(exp1)[:5]
             label2 = os.path.basename(exp2)[:5]
+            
+
 
             # get genes that are significant in both experiements and their direction:
             df1_sp = set(df3[(df3.padj1st<=0.05) & (df3.logfc1st>0)].index)
@@ -509,9 +519,11 @@ if __name__ == '__main__':
             df2_nsn = set(df3[(df3.padj   >0.05) & (df3.logfc   <0)].index)
 
             verbalise(
-                    "B", 
-                    "\n\n%s (%d orthologs) vs %s (%d orthologs) : %d shared orthologs" % (
-                         label1, len(df1), label2, len(df2), len(df3))
+    "B", 
+    "\n\n%s (%d orthologs r %.1f) vs\n%s (%d orthologs r %.1f) : %d shared orthologs" % (
+                         label1.upper(), len(df1), r1, 
+                         label2.upper(), len(df2), r2, 
+                         len(df3))
                       )
             verbalise("G", "%s: %d significant and pos" % (label1, len(df1_sp)))
             verbalise("G", "%s: %d significant and neg" % (label1, len(df1_sn)))
@@ -519,7 +531,7 @@ if __name__ == '__main__':
             verbalise("C", "%s: %d significant and pos" % (label2, len(df2_sp)))
             verbalise("C", "%s: %d significant and neg" % (label2, len(df2_sn)))
             verbalise("C", "%s: %d all significant    " % (label2, len(df2_sp | df2_sn)))
-
+            verbalise("M", df3.loc['APR2016_00001325:'])
             concordance_sets = concordancecounts(df1_sp, df2_sp, df1_sn, df2_sn,
                               df1_nsp, df2_nsp, df1_nsn, df2_nsn)
 
