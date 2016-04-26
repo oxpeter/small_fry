@@ -10,15 +10,15 @@ import collections
 import itertools
 import os
 import re
+import subprocess
 import sys
 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
-import Tkinter as tk   # for viewing the venn diagram
 import Image, ImageDraw, ImageFont # for saving the venn diagram
-
+import seaborn as sns
 
 from genomepy import config
 import brain_machine as bm
@@ -29,12 +29,25 @@ def define_arguments():
     parser = argparse.ArgumentParser(description=
             "Performs set analysis on multiple lists and outputs venn diagrams and graphs showing how many are concordant/non-concordant etc")
 
-    # input options
+    # logging options
+    parser.add_argument("-o", "--output", type=str, default='lorf2.out',
+                        help="specify the filename to save results to")
+    parser.add_argument("-d", "--directory", type=str,
+                        help="specify the directory to save results to")
+    parser.add_argument("-v", "--visible", action='store_true',default=False,
+                        help="show charts and graphs")
+    parser.add_argument("-q", "--quiet", action='store_true',default=False,
+                        help="don't print messages")
+
+    # file input options
     parser.add_argument("experiments", metavar='filename', nargs='*', type=str,
-                        help="a data file for comparing")
+                        help="a DESeq2 P-value output file")
     parser.add_argument("orthologs", nargs=1, type=str,
-                        help="orthomcl-formatted ortholog file")
-    
+                        help="""orthomcl-formatted mcl output file. Each line of the file
+                        starts with the ortholog group ID, followed by all members of the
+                        group. The first 4 characters of each gene id identify the
+                        species, followed by a pipe ("|") character. eg Cbir|LOC123456""")
+
     parser.add_argument("-m", "--mustcontain", type=str,
                         help="""comma-separated list containing 4-letter species codes
                         that must be present in each set of orthologs to include that set
@@ -43,32 +56,17 @@ def define_arguments():
                         help="""comma-separated list containing 4-letter species codes
                         that will be ignored in determining unique orthologous groups
                         """)
-    parser.add_argument("-f", "--first", type=str,
-                        help="specify the first DESeq2 P-value output file to use")
-    parser.add_argument("-s", "--second", type=str,
-                        help="specify the second DESeq2 P-value output file to use")
     parser.add_argument('-c', '--calibrate', type=str,
                         help="""provide an ortholog group name that is differentially
                         expressed in the same direction in all experiments, to ensure
                         that all directionality is consisent across experiments.""")
-    parser.add_argument("-q", "--quiet", action='store_true',default=False,
-                        help="don't print messages")
-    parser.add_argument("-o", "--output", type=str, default='lorf2.out',
-                        help="specify the filename to save results to")
-    parser.add_argument("-d", "--directory", type=str,
-                        help="specify the directory to save results to")
-    parser.add_argument("-v", "--visible", action='store_true',default=False,
-                        help="show charts and graphs")
 
-
+    # analysis options
     parser.add_argument("-L", "--list_genes", action='store_true',
-                        help="""list common significant genes. (provide a file for name 
-                        expansion""")
+                        help="""list all common significant genes.""")
     parser.add_argument("-A", "--findall", action='store_true',
-                        help="""find all significant concordant genes between given 
+                        help="""find all significant concordant genes between given
                         datasets""")
-    parser.add_argument("-R", "--reversepolarity", action='store_true',
-                        help="reverse the polarity of log fold change for second set")
 
     return parser
 
@@ -92,16 +90,16 @@ def fetch_orthologs(orthofile, mustcontain=None, exclude=None):
                 whitelist = mustcontain
             else:
                 whitelist = counts.keys()
-            
+
             # add only if all species present only once
             # and only if all necessary species are present
-            if ( all(  c <= 1 for c in counts.values()) and 
+            if ( all(  c <= 1 for c in counts.values()) and
                  all( wl in counts.keys() for wl in whitelist )
                ):
-               
+
                 ortho_dic.update({ g:cols[0] for g in cols })
-    handle.close()        
-                
+    handle.close()
+
     return ortho_dic
 
 def translate_to_orthologs(degfile, orthodic):
@@ -127,7 +125,7 @@ def translate_to_orthologs(degfile, orthodic):
                 degdic[orthodic[cols[0]]] = padj, logfc
     handle.close()
 
-    df = pd.DataFrame([ [k, v[0], v[1]] for k,v in degdic.items() ], 
+    df = pd.DataFrame([ [k, v[0], v[1]] for k,v in degdic.items() ],
                         columns=["gene","padj","logfc"])
     indexed_df = df.set_index('gene')
     return indexed_df
@@ -169,10 +167,6 @@ def sigcounts(pos1, pos2, neg1, neg2):
     neg1_u = neg1 - concord_n - discord_2p
     neg2_u = neg2 - concord_n - discord_1p
 
-    verbalise("G", "Sum of circles", "1", len(pos1_u | neg1_u | concord_p | concord_n | discord_2p | discord_1p))
-    verbalise("C", "Sum of circles", "2", len(pos2_u | neg2_u | concord_p | concord_n | discord_2p | discord_1p))
-
-
     fordrawing = (pos1_u, pos2_u, neg2_u, neg1_u, concord_p, discord_2p, concord_n, discord_1p)
     return [str(len(s)) for s in fordrawing]
 
@@ -193,7 +187,6 @@ def concordancecounts(df1_sp, df2_sp, df1_sn, df2_sn, df1_nsp, df2_nsp, df1_nsn,
     bkgd_con = len((df1_nsp & df2_nsp) | (df1_nsn & df2_nsn) | (df1_sp & df2_sp) | (df1_sn & df2_sn))
     bkgd_dis = len((df1_nsp & df2_nsn) | (df1_nsn & df2_nsp) | (df1_sn & df2_sp) | (df1_sp & df2_sn))
     bkgd_freq = 1.0*bkgd_con/(bkgd_con+bkgd_dis)
-    verbalise("C", "Background concordance frequency = %.2f" % bkgd_freq)
 
     return (con_sig1, con_nsig1, ncon_sig1, ncon_nsig1,
             con_sig2, con_nsig2, ncon_sig2, ncon_nsig2,
@@ -248,9 +241,9 @@ def draw_graph( con_sig1, con_nsig1, ncon_sig1, ncon_nsig1,
     autolabel(p2, (ra1+ra2)/totals,         ra2/totals, ra2)
     autolabel(p3, (ra1+ra2+ra3)/totals,     ra3/totals, ra3)
     autolabel(p4, (ra1+ra2+ra3+ra4)/totals, ra4/totals, ra4)
-    pp=PdfPages(outfile)
-    plt.savefig(pp, format='pdf')
-    pp.close()
+
+    plt.savefig(outfile, format='pdf')
+
 
     if visible:
         plt.show()
@@ -335,52 +328,6 @@ def draw_circles(c1t,c2t,c3t,c4t,o1t,o2t,o3t,o4t,l1t,l2t,l3t,l4t, outfile="venn.
     c3 = (20,182,220,382)
     c4 = (162,182,362,382)
 
-    if visible:
-        root = tk.Tk()
-        root.title('A Circle')
-
-        # create canvases:
-        canvas_1 = tk.Canvas(root, width=cw, height=ch, background='white')
-        canvas_1.grid(row=0, column=1)
-        # draw circles:
-        canvas_1.create_oval(c1, outline='green', width=3)
-        canvas_1.create_oval(c2, outline='red', width=3)
-        canvas_1.create_oval(c3, outline='blue', width=3)
-        canvas_1.create_oval(c4, outline='orange', width=3)
-
-        # add text:
-        text_c1 = canvas_1.create_text( 90,  110,  font=("Calibri", 14), anchor="nw", fill='darkgreen')
-        text_c2 = canvas_1.create_text( 272, 110,  font=("Calibri", 14), anchor='nw', fill='red')
-        text_c3 = canvas_1.create_text( 90,  292, font=("Calibri", 14), anchor='nw', fill='blue')
-        text_c4 = canvas_1.create_text( 272, 292, font=("Calibri", 14), anchor='nw', fill='orange')
-
-        text_o1 = canvas_1.create_text( 182, 130, font=("Calibri"), anchor='nw')
-        text_o2 = canvas_1.create_text( 252, 200, font=("Calibri"), anchor='nw')
-        text_o3 = canvas_1.create_text( 182, 272, font=("Calibri"), anchor='nw')
-        text_o4 = canvas_1.create_text( 110, 200, font=("Calibri"), anchor='nw')
-
-        canvas_1.itemconfig(text_c1, text=c1t)
-        canvas_1.itemconfig(text_c2, text=c2t)
-        canvas_1.itemconfig(text_c3, text=c3t)
-        canvas_1.itemconfig(text_c4, text=c4t)
-        canvas_1.itemconfig(text_o1, text=o1t)
-        canvas_1.itemconfig(text_o2, text=o2t)
-        canvas_1.itemconfig(text_o3, text=o3t)
-        canvas_1.itemconfig(text_o4, text=o4t)
-
-        # add labels:
-        label_c1 = canvas_1.create_text( 70,  10,   font=("Calibri", 14), anchor="nw", fill='darkgreen')
-        label_c2 = canvas_1.create_text( 242, 10,   font=("Calibri", 14), anchor="nw", fill='red')
-        label_c3 = canvas_1.create_text( 242, 402,  font=("Calibri", 14), anchor="nw", fill='orange')
-        label_c4 = canvas_1.create_text( 70,  402,  font=("Calibri", 14), anchor="nw", fill='blue')
-
-        canvas_1.itemconfig(label_c1, text=l1t)
-        canvas_1.itemconfig(label_c2, text=l2t)
-        canvas_1.itemconfig(label_c3, text=l3t)
-        canvas_1.itemconfig(label_c4, text=l4t)
-
-        root.mainloop()
-
     # create canvases:
     image1 = Image.new("RGB", (cw, ch), white)
     draw = ImageDraw.Draw(image1)
@@ -409,9 +356,11 @@ def draw_circles(c1t,c2t,c3t,c4t,o1t,o2t,o3t,o4t,l1t,l2t,l3t,l4t, outfile="venn.
     draw.text((242, 402),l3t,orange, font=ImageFont.truetype('/usr/share/fonts/truetype/ttf-dejavu/DejaVuSerif-Bold.ttf', 16))
     draw.text((70,  402),l4t,greyblue, font=ImageFont.truetype('/usr/share/fonts/truetype/ttf-dejavu/DejaVuSerif-Bold.ttf', 16))
 
-    image1.show()
     image1.save(outfile)
-    image1.show()
+    if visible:
+        image1.show()
+
+    return outfile
 
 
 
@@ -430,13 +379,13 @@ if __name__ == '__main__':
             verbalise("R", "%s could not be found" % (f))
             stop = True
     if stop:
-        exit() 
+        exit()
 
     if args.exclude:
         exclusions = args.exclude.split(',')
     else:
         exclusions = None
-        
+
     if args.mustcontain:
         necessary = args.mustcontain.split(',')
     else:
@@ -445,67 +394,57 @@ if __name__ == '__main__':
     #args = replace_genenames(args)
     #verbalise("Y", "Ortholog file saved to %s" % os.path.basename(args.second))
     print "Ortholog file must contain:", args.mustcontain
-    orthodic = fetch_orthologs(args.orthologs[0], 
-                                mustcontain=necessary, 
+    orthodic = fetch_orthologs(args.orthologs[0],
+                                mustcontain=necessary,
                                 exclude=exclusions)
     verbalise("G", "%d unique ortholog groups were found" % len(orthodic.items()))
-    
-    
-    if args.first and args.second:
-        # returns the genes that are significant and concordant in pos and neg directions:
-        pcs, ncs = compare_two(args, logfile)
-        common_to_all = pcs | ncs
-    
-    if args.experiments:
 
-        # initialise containers:        
+
+    if len(args.experiments) > 2:
+        # initialise containers:
         concordant_array = pd.DataFrame(
                 None,
                 index=[os.path.basename(e)[:5] for e in args.experiments],
                 columns=[os.path.basename(e)[:5] for e in args.experiments]
                 )
         concordant_sig_genesets = []
+        pdfhandle = PdfPages(logfile[:-3] + "barcharts.pdf")
+        all_pngs = []
 
         # do all pairwise comparisons:
         for (exp1, exp2) in itertools.product(args.experiments, args.experiments):
-            # itertools.product produces an all-by-all comparison of the two lists
-            # because this will include the same file compared to itself, we need
-            # to remove those cases (which would mess up our comparisons):
+            """
+            itertools.product produces an all-by-all comparison of the two lists
+            because this will include the same file compared to itself, we need
+            to remove those cases (which would mess up our comparisons):
+            """
             if exp1 == exp2:
                 continue
-            
+
             # get dataframes containing orthologs
             df1 = translate_to_orthologs(exp1, orthodic)
             df2 = translate_to_orthologs(exp2, orthodic)
-            
-            
-            # the ratio of positive to negative log fold changes in a sample are 
-            # probably consistent across species. So looking for a ratio gt or lt 1 in the
-            # first sample, then convert all remaining samples to match, should give the
-            # greatest concordance, and represent equivalent experimental conditions
+
+            # if ortholog group is provided for polarity calibration, make sure all
+            # changes for this ortholog are positive.
+            if args.calibrate and df1['logfc'].loc[args.calibrate] < 0:
+                df1.logfc = df1.logfc * -1
+            if args.calibrate and df2['logfc'].loc[args.calibrate] < 0:
+                df2.logfc = df2.logfc * -1
+
+            # calculate the ratio of positive to negative changes
             p1 = df1[(df1.logfc > 0) & (df1.padj <= 0.05)].count()["logfc"]
             n1 = df1[(df1.logfc < 0) & (df1.padj <= 0.05)].count()["logfc"]
             r1 = 1. * p1 / (n1 + 1)
-            if args.calibrate and df1['logfc'].loc[args.calibrate] < 0:
-                df1.logfc = df1.logfc * -1
-            
-            #if r1 < 1:
-            #    df1.logfc = df1.logfc * -1
-            
+
             p2 = df2[(df2.logfc > 0) & (df2.padj <= 0.05)].count()["logfc"]
             n2 = df2[(df2.logfc < 0) & (df2.padj <= 0.05)].count()["logfc"]
             r2 = 1. * p2 / (n2 + 1)
-            if args.calibrate and df2['logfc'].loc[args.calibrate] < 0:
-                df2.logfc = df2.logfc * -1
-            #if r2 < 1:
-            #    df1.logfc = df1.logfc * -1
-            
-                        
-            df3 = df1.join(df2, how='left', lsuffix="1st").dropna()            
+
+            # create merged dataset with only genes common to both species:
+            df3 = df1.join(df2, how='left', lsuffix="1st").dropna()
             label1 = os.path.basename(exp1)[:5]
             label2 = os.path.basename(exp2)[:5]
-            
-
 
             # get genes that are significant in both experiements and their direction:
             df1_sp = set(df3[(df3.padj1st<=0.05) & (df3.logfc1st>0)].index)
@@ -518,11 +457,12 @@ if __name__ == '__main__':
             df1_nsn = set(df3[(df3.padj1st>0.05) & (df3.logfc1st<0)].index)
             df2_nsn = set(df3[(df3.padj   >0.05) & (df3.logfc   <0)].index)
 
+            # report output
             verbalise(
-    "B", 
-    "\n\n%s (%d orthologs r %.1f) vs\n%s (%d orthologs r %.1f) : %d shared orthologs" % (
-                         label1.upper(), len(df1), r1, 
-                         label2.upper(), len(df2), r2, 
+    "B",
+    "\n\n%s (%d orthologs, er=%.1f) vs\n%s (%d orthologs, er=%.1f) : %d shared orthologs" % (
+                         label1.upper(), len(df1), r1,
+                         label2.upper(), len(df2), r2,
                          len(df3))
                       )
             verbalise("G", "%s: %d significant and pos" % (label1, len(df1_sp)))
@@ -531,7 +471,7 @@ if __name__ == '__main__':
             verbalise("C", "%s: %d significant and pos" % (label2, len(df2_sp)))
             verbalise("C", "%s: %d significant and neg" % (label2, len(df2_sn)))
             verbalise("C", "%s: %d all significant    " % (label2, len(df2_sp | df2_sn)))
-            verbalise("M", df3.loc['APR2016_00001325:'])
+
             concordance_sets = concordancecounts(df1_sp, df2_sp, df1_sn, df2_sn,
                               df1_nsp, df2_nsp, df1_nsn, df2_nsn)
 
@@ -540,11 +480,46 @@ if __name__ == '__main__':
             concordant_array[label1].loc[label2] = len(concordance_sets[0])
             verbalise("Y", "concordant DEGs = ", len(concordance_sets[0]))
 
+            # create graphs of overlapping DEGs:
+            scounts = sigcounts(df1_sp, df2_sp, df1_sn, df2_sn)
+            pos1_u,pos2_u,neg2_u,neg1_u,concord_p,discord_2p,concord_n,discord_1p = scounts
+
+            outpng = draw_circles(pos1_u, pos2_u,
+                        neg2_u, neg1_u,
+                        concord_p, discord_2p,
+                        concord_n, discord_1p,
+                        label1+" pos", label2+" pos", label1+" neg", label2+" neg",
+                        outfile= "%s%s_%s.venn.png" % (logfile[:-3],label1,label2 ),
+                        visible=args.visible  )
+
+            all_pngs.append(outpng) # will be concatenated into a single pdf later.
+            concordance_sets = concordancecounts(df1_sp, df2_sp, df1_sn, df2_sn,
+                                                 df1_nsp, df2_nsp, df1_nsn, df2_nsn)
+            draw_graph( *[len(s) for s in concordance_sets[:-1]],
+                        bkgd_freq=concordance_sets[-1],
+                        label1=label1, label2=label2,
+                        outfile=pdfhandle,
+                        visible=args.visible )
+
+        # collate images, close output files and cleanup:
+        pdfhandle.close()
+        # convert is from the imagemagick ubuntu install
+        status = subprocess.call(
+                ["convert"] + all_pngs + ["%svenn_diagrams.pdf" % logfile[:-3]]
+                                )
+        for f in all_pngs:
+            os.remove(f)
+
+        ########### SUMMARY OF ALL DATASETS ###########
         common_to_all = set.intersection(*concordant_sig_genesets)
         verbalise("R", "\nThere are %d genes common to all datasets" % len(common_to_all))
 
+
         print concordant_array
-        
+        #TODO: take this array and calculate distances between species
+    else:
+        verbalise("R", "Insufficient output files were provided")
+
     if args.list_genes:
         """
         ncbi = bm.ncbi_dic(args.list_genes)
