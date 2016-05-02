@@ -29,7 +29,8 @@ def define_arguments():
 
     # analysis options
     parser.add_argument("-p", "--pattern", type=str, default='(gb|ref)\|([^\|]+)\|',
-                        help="specify the regex to locate peptide name")
+                        help="""specify the regex to locate peptide name.
+                        default='(gb|ref)\|([^\|]+)\|'""")
     parser.add_argument("-c", "--column", type=int, default=0,
                         help = "the column in which to convert names. (default=0)")
     parser.add_argument("-q", "--quiet", action='store_true',default=False,
@@ -74,6 +75,42 @@ def col_counter(columns,column):
         for col in columns:
             yield col
 
+def replace_defline(isodic, filename, outfile, column=None):
+    """
+    Search for XP terms in defline, and replace them from isodic as appropriate.
+    """
+    handle = open(filename, 'rb')
+    outhandle = open(outfile, 'w')
+
+    for line in handle:
+        columns = line.split()
+
+        # skip blank lines
+        if len(columns) == 0:
+            continue
+
+        # only try to modify deflines!
+        if line[0] == ">":
+            # only modify in specified columns (None means check all):
+            valid_columns = col_counter(columns, column)
+            for col, contents in enumerate(valid_columns):
+                isoform_check = re.search("(XP[^\|\s]+)", contents)
+                if isoform_check:
+                    if isoform_check.group(1) in isodic:
+                        columns[col] = isodic[isoform_check.group(1)][0]
+
+            # make sure '>' has not been lost from front of defline:
+            if columns[0][0] != ">":
+                columns[0] = ">" + columns[0]
+
+        # write modified (or unmodified) line to new file:
+        try:
+            outhandle.write("%s\n" % (" ".join(columns)))
+        except TypeError:
+            verbalise("R", columns)
+            sys.exit(1)
+
+
 def replace_all(isodic, filename, outfile, prefix, column=None):
     """
     search for gene ids in the specified columns (if none, will search all columns)
@@ -83,13 +120,16 @@ def replace_all(isodic, filename, outfile, prefix, column=None):
     """
     handle = open(filename, 'rb')
     outhandle = open(outfile, 'w')
+    print "Prefix:", prefix
 
     for line in handle:
         # check the line has the species prefix:
         columns = line.split()
-        prefix_check = [ re.search(prefix, col) for col in columns]
-        pattern = prefix + "\|?([\S]+)"
-        isocheck = None
+        if prefix != "":
+            prefix_check = [ re.search(prefix, col) for col in columns]
+        else:
+            prefix_check = [ True for col in columns ]
+        pattern = prefix + "\|?(\S+)"
 
         valid_columns = col_counter(columns, column)
         for col, contents in enumerate(valid_columns):
@@ -99,6 +139,8 @@ def replace_all(isodic, filename, outfile, prefix, column=None):
                 if isocheck:
                     if isocheck.group(1) in isodic:
                         columns[col] = prefix + "|" + isodic[isocheck.group(1)][0]
+
+
         try:
             outhandle.write("%s\n" % ("\t".join(columns)))
         except TypeError:
@@ -110,6 +152,9 @@ def replace_all(isodic, filename, outfile, prefix, column=None):
         #            outhandle.write(line)
 
 def replace_fasta(isodic, fasta, outfile):
+    """
+    DEPRECATED: Use replace_defline instead
+    """
     handle = open(fasta, 'rb')
     outhandle = open(outfile, 'w')
 
@@ -353,7 +398,8 @@ if __name__ == '__main__':
         egvals = " : ".join([str(val) for val in isodic.values()[:5]])
         verbalise("B", "%s\n%s" % (egkeys, egvals) )
         verbalise("writing new file")
-        replace_fasta(isodic, args.fasta, logfile[:-3]+'out')
+        replace_defline(isodic, args.fasta, logfile[:-3]+'pep', column=None)
+        #replace_fasta(isodic, args.fasta, logfile[:-3]+'pep')
     elif args.replace_all:
         verbalise("building isoform dictionary")
         isodic = build_isodic(args.gff, idbig=args.large_term, idsmall=args.small_term)
