@@ -21,6 +21,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 from sklearn import svm
 from sklearn.feature_selection import RFE, RFECV
 from sklearn import preprocessing
+from sklearn.ensemble import RandomForestClassifier
 
 from genomepy import config
 import kegg
@@ -32,7 +33,7 @@ import kegg
 ###########  FUNCTIONS  ###############
 def define_arguments():
     parser = argparse.ArgumentParser(description=
-            "Performs set analysis on multiple lists and outputs venn diagrams and graphs showing how many are concordant/non-concordant etc")
+            "performs various support vector machine learning algorithms on RNA-Seq datasets")
 
     # input options
     parser.add_argument("configfile", metavar='filename', nargs=1, type=str,
@@ -117,14 +118,46 @@ def assemble_df(htseq_list, lognorm=True, sfnorm=False):
         df=df/df.mean(axis=0)
     return df
 
-def index_orthos(df, orthofile):
-    orthodf = pd.read_csv(orthofile, sep="\t", header=None, index_col=0, names=['orthos'])
-    newdf = df.join(orthodf).dropna()
-    newdf.set_index(['orthos'], inplace=True)
+def sort_orthos(row):
+    if row['ortho1'].str.split('|').str[0] == 'Cbir':
+        return row['ortho2'].str.split('|').str[1], row['ortho1'].str.split('|').str[1]
+    elif row['ortho2'].str.split('|').str[0] == 'Cbir':
+        return row['ortho1'].str.split('|').str[1], row['ortho2'].str.split('|').str[1]
+    else:
+        return np.nan, np.nan
+
+def create_ortho_df(orthofile):
+    # create new dataframe from orthomcl ortholog output file:
+    orthodf = pd.read_csv(orthofile, sep="\t", header=None, names=['ortho1','ortho2', 'score'])
+
+    # create new column for Cerapachys orthologs:
+    orthodf['cbir_loc'] = np.nan
+    orthodf.loc[ orthodf['ortho1'].str.split('|').str[0] == 'Cbir', 'cbir_loc' ] = orthodf['ortho1'].str.split('|').str[1]
+    orthodf.loc[ orthodf['ortho2'].str.split('|').str[0] == 'Cbir', 'cbir_loc' ] = orthodf['ortho2'].str.split('|').str[1]
+    # create new column for other species' orthologs:
+    orthodf = orthodf.dropna(subset = ['cbir_loc'])
+    orthodf['other_loc'] = np.nan
+    orthodf.loc[ orthodf['ortho1'].str.split('|').str[0] == 'Cbir', 'other_loc' ] = orthodf['ortho2'].str.split('|').str[1]
+    orthodf.loc[ orthodf['ortho2'].str.split('|').str[0] == 'Cbir', 'other_loc' ] = orthodf['ortho1'].str.split('|').str[1]
+
+    # set index of df to the non-Cbir ortholog:
+    orthodf.set_index(['other_loc'], inplace=True)
+    orthodf = orthodf[['cbir_loc']]
+    return orthodf
+
+def index_orthos(df, orthodf):
+    # join to other dataframe, which is indexed with non-Cbir orthologs:
+    newdf = df.join(orthodf).dropna()  # also removes any rows with no orthologs
+    newdf.set_index(['cbir_loc'], inplace=True)
     return newdf
 
 def to_binary(names):
-    binary = [ int(re.search("(QUEEN|WORKER|FOUNDRESS|GYNE|FORAGER|NURSE|_FL|_SP|EMERGED)",name.upper()).group(1) in ['QUEEN','FOUNDRESS','GYNE','_SP'] ) for name in names  ]
+    try:
+        binary = [ int(re.search("(QUEEN|WORKER|FOUNDRESS|GYNE|FORAGER|NURSE|_FL|_SP|EMERGED|ALPHA|LOW)",name.upper()).group(1) in ['QUEEN','FOUNDRESS','GYNE','_SP','ALPHA'] ) for name in names  ]
+    except AttributeError:
+        print names
+        exit()
+
     return binary
 
 def create_xy(df1, df2, normalise=False):
@@ -134,6 +167,7 @@ def create_xy(df1, df2, normalise=False):
     for queen/statary
     """
     jointdf = df1.join(df2).dropna()
+
     # remove duplicates:
     jointdf["index"] = jointdf.index
     jointdf.drop_duplicates(subset='index', take_last=True, inplace=True)
@@ -165,6 +199,20 @@ def predictor_svm(X1, y1, X2, y2):
     verbalise("G", "score: %.2f (p=%.5f)\n" % (cscore, pval ))
     return clf.coef_, clf.score(X2, y2)
 
+def random_forest_engine(X1, y1, X2, y2):
+    verbalise("C", "Size of training set: %d\nSize of test set: %d" % (len(y1), len(y2)))
+    verbalise("C", "Number of features: %d" % X1.shape[1])
+    clf = RandomForestClassifier(max_features='log2', n_estimators=120, random_state=125)
+    #print clf
+    clf.fit(X1, y1)
+    verbalise("Y", "real: %s\npred: %s" % (
+            " ".join([str(x) for x in y2]), " ".join([ str(x) for x in clf.predict(X2)])
+            ))
+    cscore = clf.score(X2, y2)
+    pval = prob( len(y2)-round(cscore*len(y2)) + 1, 0.5, len(y2) )
+    verbalise("G", "score: %.2f (p=%.5f)\n" % (cscore, pval ))
+    return clf.score(X2, y2)
+
 def get_features_rfe(X1, y1, X2, ffn=100):
     verbalise("C", "Sample size of set: %d" % (len(y1)) )
     verbalise("C", "Initial number of features: %d" % X1.shape[1] )
@@ -194,24 +242,54 @@ def get_features_rfecv(X1, y1, X2, step=1, cv=None):
             (newX1.shape[1], cv, selector.grid_scores_[newX1.shape[1] - 1] ))
     return newX1, newX2, selector.support_, selector.grid_scores_
 
-def multitest(df1, df2, name1='X1', name2='X2', ffn=100, normtogether=False, normind=False, cv=None):
-    "normtogether normalises training and testing data together. "
-    verbalise("M", "Predicting %s phase with %s using linear kernel SVM" % (name2, name1))
-    X1, y1, X2, y2, dfindex = create_xy(df1, df2, normalise=normtogether)
-    if normind:
-        X1 = preprocessing.scale(X1)
-        X2 = preprocessing.scale(X2)
-    weights, df2_score = predictor_svm(X1, y1, X2, y2)
-    verbalise("M", "Using RFE %s" % (name1))
-    X1s, X2s, rfemask, refweights = get_features_rfe(X1, y1, X2, ffn=ffn)
-    df2_score = predictor_svm(X1s, y1, X2s, y2)
-    verbalise("M", "Using RFECV on %s" % (name1))
-    X1c, X2c, rfecvmask, rfecv_gscores = get_features_rfecv(X1s, y1, X2s, cv=cv)
-    df2_score = predictor_svm(X1c, y1, X2c, y2)
-    print "-" * 75
-    rfe_features = [ pair[0] for pair in zip(dfindex, rfemask) if pair[1] ]
-    rfecv_features = [ pair[0] for pair in zip(dfindex, rfecvmask) if pair[1] ]
+def relativise_vst(X, logpowers=False):
+    """
+    make each gene expression value relative to mean expression value of all genes. If
+    logpowers is False, then the values returned are the power to which the geometric
+    mean of the samples **untransformed** values must be raised in order to get the
+    untransformed value of the gene. If logpowers is True, then the values are the
+    natural log of this power value (ie, positive values are higher than mean, negative
+    values are lower than mean).
+    """
+    powers = X / np.mean(X,0)
+    if logpowers:
+        logpowers = np.log(powers)
+        return logpowers
+    else:
+        return powers
 
+def multitest(df1, df2, degs=None, name1='X1', name2='X2',
+                ffn=100, normtogether=False, normind=False, cv=None):
+    "normtogether normalises training and testing data together. "
+
+    verbalise("M", "Predicting %s phase with %s using linear kernel SVM" % (name2, name1))
+    if degs:
+        dfd = reducedf(df1, degs)
+    else:
+        dfd = df1
+    X1, y1, X2, y2, dfindex = create_xy(dfd, df2, normalise=normtogether)
+    if normind:
+        X1 = relativise_vst(X1,logpowers=True)
+        X2 = relativise_vst(X2,logpowers=True)
+    weights, df2_score = predictor_svm(X1, y1, X2, y2)
+
+    #verbalise("M", "Using RFE %s" % (name1))
+    #X1s, X2s, rfemask, refweights = get_features_rfe(X1, y1, X2, ffn=ffn)
+    #df2_score = predictor_svm(X1s, y1, X2s, y2)
+
+    #verbalise("M", "Using RFECV on %s" % (name1))
+    #X1c, X2c, rfecvmask, rfecv_gscores = get_features_rfecv(X1s, y1, X2s, cv=cv)
+    #df2_score = predictor_svm(X1c, y1, X2c, y2)
+
+    verbalise("M", "Using Random Forest on %s" % (name1))
+    X1, y1, X2, y2, dfindex = create_xy(df1, df2, normalise=normtogether)
+    df2_score = random_forest_engine(X1, y1, X2, y2)
+
+    print "-" * 75
+    #rfe_features = [ pair[0] for pair in zip(dfindex, rfemask) if pair[1] ]
+    #rfecv_features = [ pair[0] for pair in zip(dfindex, rfecvmask) if pair[1] ]
+    rfe_features = None
+    rfecv_features = None
     return weights, rfe_features, rfecv_features, dfindex
 
 def report_genes(weights, rfes, rfecvs, df_index, num=25):
@@ -294,7 +372,28 @@ def compare_two(pp, dfpair, training, testing, genelist1, genelist2, name1, name
         plt.close()
 
 def reducedf(df, genelist):
+    #rint df.info()
+    #print 'genelist = %s' % genelist
+    #print df.loc[genelist].info()
     return df.loc[genelist]
+
+def deg_df_list(deseq_out, orthodf=None, convert=False):
+    df = pd.read_csv(deseq_out, header=0, index_col=0, sep=' ')
+    try:
+        df = df[ df['padj'] <= 0.05 ]
+    except KeyError:
+        print deseq_out
+        print df.columns
+        print df
+        exit()
+    if convert:
+        df = df.join(orthodf).dropna()
+        degs = df['cbir_loc'].values
+    else:
+        degs = df.index.values
+
+    print degs[:5]
+    return degs
 
 ###########  ANALYSES  ################
 if __name__ == '__main__':
@@ -306,16 +405,23 @@ if __name__ == '__main__':
 
     config_d = load_config(args.configfile[0])
 
+    print "Creating ortholog db..."
+    orthodf = create_ortho_df(config_d['convert_orthos'])
+
+    print "Extracting lists of DEGs..."
     # create lists of all DEGs from each experiment:
-    meth_degs = config.make_a_list(config_d['meth_degs_f'])
-    brsw_degs = config.make_a_list(config_d['brsw_degs_f'])
-    acro_degs = config.make_a_list(config_d['acro_degs_f'])
-    bsse_degs = config.make_a_list(config_d['bsse_degs_f'])
-    sinv_degs = config.make_a_list(config_d['sinv_qf_degs'])
+    meth_degs = deg_df_list(config_d['meth_degs_f'])
+    brsw_degs = deg_df_list(config_d['brsw_degs_f'])
+    acro_degs = deg_df_list(config_d['acro_degs_f'], orthodf, convert=True)
+    bsse_degs = deg_df_list(config_d['bsse_degs_f'])
+    sinv_degs = deg_df_list(config_d['sinv_rnr_degs'], orthodf, convert=True)
+    cbir_degs = deg_df_list(config_d['cbir_degs_f'])
+    dqua_degs = deg_df_list(config_d['dqua_degs_f'], orthodf, convert=True)
 
     # create dictionary for extracting ncbi names of Cbir genes:
     ncbi = ncbi_dic(file=config_d['ncbi_names'])
 
+    """
     # collect all raw count data:
     meth_r = [ os.path.join(config_d['meth_rd'],file)
                 for file in os.listdir(config_d['meth_rd']) if re.search("^M.*htseq.gene",file) ]
@@ -332,12 +438,13 @@ if __name__ == '__main__':
                     if re.search("B[456].*(_FL|_SP).+htseq.gene",file) ]
     sinv_r = [ os.path.join(config_d['sinv_rd'],file)
                 for file in os.listdir(config_d['sinv_rd']) if re.search("htseq.gene",file) ]
+    """
 
     #verbalise( "Number of files found for each study:")
     #verbalise("G", "Meth: %d\nBrSw: %d\nBSse: %d\nPolK: %d\nPolU: %d\nAcro: %d" % (len(meth_r), len(brsw_r), len(bsse_r), len(polk_r), len(polu_r), len(acro_r)))
 
     print "\nAssembling dataframes...\n"
-
+    """
     meth_df = assemble_df(meth_r, lognorm=True, sfnorm=False)
     brsw_df = assemble_df(brsw_r, lognorm=True, sfnorm=False)
     bsse_df = assemble_df(bsse_r, lognorm=True, sfnorm=False)
@@ -346,29 +453,165 @@ if __name__ == '__main__':
     acro_df = assemble_df(acro_r, lognorm=True, sfnorm=False)
     cbir_df = meth_df.join(brsw_df).join(bsse_df)
     sinv_df = assemble_df(sinv_r, lognorm=True, sfnorm=False)
+    """
 
     # create dataframes of vst:
-    meth_vst = pd.read_csv(config_d['meth_f'], sep=" ", header=0)
-    brsw_vst = pd.read_csv(config_d['brsw_f'], sep=" ", header=0)
-    polu_vst = pd.read_csv(config_d['polu_f'], sep=" ", header=0)
-    polk_vst = pd.read_csv(config_d['polk_f'], sep=" ", header=0)
-    acro_vst = pd.read_csv(config_d['acro_f'], sep=" ", header=0)
-    sinv_vst = pd.read_csv(config_d['sinv_f'], sep=" ", header=0)
+    meth_vst = pd.read_csv(config_d['meth_vst'], sep=" ", header=0)
+    brsw_vst = pd.read_csv(config_d['brsw_vst'], sep=" ", header=0)
+    cbir_vst = pd.read_csv(config_d['cbir_vst'], sep=" ", header=0)
+    polu_vst = pd.read_csv(config_d['polu_vst'], sep=" ", header=0)
+    polk_vst = pd.read_csv(config_d['polk_vst'], sep=" ", header=0)
+    acro_vst = pd.read_csv(config_d['acro_vst'], sep=" ", header=0)
+    sinv_vst = pd.read_csv(config_d['sinv_vst'], sep=" ", header=0)
+    dqua_vst = pd.read_csv(config_d['dqua_vst'], sep=" ", header=0)
 
     # convert to orthologs:
-    polu_ortho = index_orthos(polu_df, config_d['convert_orthos'])
-    polk_ortho = index_orthos(polk_df, config_d['convert_orthos'])
-    acro_ortho = index_orthos(acro_df, config_d['convert_orthos'])
-    sinv_ortho = index_orthos(sinv_df, config_d['convert_orthos'])
+    polu_ortho = index_orthos(polu_vst, orthodf)
+    polk_ortho = index_orthos(polk_vst, orthodf)
+    acro_ortho = index_orthos(acro_vst, orthodf)
+    sinv_ortho = index_orthos(sinv_vst, orthodf)
+    dqua_ortho = index_orthos(dqua_vst, orthodf)
 
-    all_degs = meth_degs.keys()+brsw_degs.keys()
+
+    all_degs = set( cbir_degs ) | set( acro_degs ) | set( sinv_degs ) | set( dqua_degs )
+
+    # combine all ant orthologs into singe df:
+    ants_ortho = cbir_vst.join(acro_ortho).join(sinv_ortho).join(dqua_ortho).dropna()
+    verbalise("Y", "Number of genes in common = %-6d total size = %d" % (len(set(ants_ortho.index.values)), len(ants_ortho.index.values)))
+
+    # extract only orthologs that are 1:1:1:1 (some "orthologs" have two genes in
+    # some species! (708 to be precise, across all four species after nans have been
+    # removed)
+    uniq_np, np_counts = np.unique(ants_ortho.index.values, return_counts=True)
+    uniq_loci = []
+    for i, idx in enumerate(uniq_np):
+        if np_counts[i] == 1:
+            uniq_loci.append(idx)
+
+    ants_uniq = ants_ortho.loc[uniq_loci,:]
+
+    verbalise("C", "Combined df (4 ants) has %d uniquely orthologous genes and %d samples" % (ants_uniq.shape[0], ants_uniq.shape[1] ))
+
+    ants_by_deg = ants_uniq.loc[list(all_degs)]
+    print ants_by_deg.shape
+    print len(all_degs), "DEGs with C.biroi ortholog present across all pairwise comparisons"
+    print len(cbir_degs), "DEGs for C.biroi"
+    print len(sinv_degs), "DEGs for S.invicta"
+    print len(set(cbir_degs) | set(sinv_degs)) , "DEGs shared between Cbir and Sinv"
+    y = to_binary(ants_uniq.columns)
+    X = ants_uniq.T.values
+    names = ants_uniq.index.values
+    exit()
+
+    # recursive feature elimination with cross validation of combined set:
+    """
+    verbalise("C", "Sample size of set: %d" % (len(y)) )
+    verbalise("C", "Initial number of features: %d" % X.shape[1] )
+    cv = 10
+    estimator = svm.SVR(kernel="linear")
+    selector = RFECV(estimator, cv=cv, step=10, scoring=None)
+    selector = selector.fit(X, y)
+
+
+    reducedX = selector.transform(X)
+    print selector.grid_scores_
+    verbalise("C",
+        "Final number of features: %d (average of %d CV scores = %.3f)" %
+            (selector.n_features_, cv, selector.grid_scores_[0] ))
+
+    genescore = zip(selector.support_, selector.ranking_)
+
+    verbalise("C", "%d features:\n%s\nRANKING:\n%s" % (selector.n_features_,
+                    [ i for i in range(len(selector.support_)) if selector.support_[i]],
+                    len(selector.ranking_)))
+
+    selected_features = [ (show_name(names[i], ncbi), score[1]) for i,score in enumerate(genescore) if selector.support_[i]]
+    sorted_features = sorted(selected_features, key=lambda x: x[1], reverse=True)
+
+
+    verbalise("M", '\n'.join([ "%d %s" % (i[1], i[0]) for i in sorted_features]))
+
+
+    # plot results:
+    plt.figure()
+    plt.xlabel("Number of features selected")
+    plt.ylabel("Cross validation score (nb of correct classifications)")
+    plt.plot(range(1, len(selector.grid_scores_) + 1), selector.grid_scores_)
+    plt.show()
+    """
+
+    # use to find good number of trees:
+    """
+    error_rate = []
+    for n in np.arange(2,500,2):
+        rf = RandomForestClassifier(max_features="log2", n_estimators=n,
+                                    oob_score=True,random_state=125)
+        #print rf
+        rf.fit(X,y)
+        error_rate.append( 1 - rf.oob_score_ )
+
+    plt.plot(error_rate)
+    plt.xlabel("n_estimators")
+    plt.ylabel("OOB error rate")
+    plt.show()
+    """
+
+    # iteratively drop genes:
+    """
+    dropem = []
+    for i in range(200):
+        sh_before = ants_uniq.shape
+        df = ants_uniq.drop(dropem)
+        sh_after = df.shape
+        verbalise("C", sh_before, "minus %d genes =" % len(dropem), sh_after)
+        verbalise("B", dropem[-20:])
+
+        # create matrices:
+        X = df.T.values
+        y = to_binary(df.columns)
+        names = df.index.values
+
+        # calculate random forest:
+        rf = RandomForestClassifier(max_features='log2', n_estimators=120,
+                                    oob_score=True, random_state=125)
+        rf.fit(X,y)
+        verbalise("Y", "score:", rf.oob_score_)
+        # select worst performers to add to dropem list:
+        best_to_worst = sorted(zip(map(lambda x: round(x, 4), rf.feature_importances_), names),
+                                reverse=True)
+        verbalise("C", len(best_to_worst))
+        dropem += [ p[1] for p in best_to_worst[ -(int(len(best_to_worst)/20.0)): ] ]
+
+        print "\n".join([ "%.4f %s" % (p[0], show_name(p[1],ncbi)) for p in best_to_worst[:5] ])
+        print "..."
+        print "\n".join([ "%.4f %s" % (p[0], show_name(p[1],ncbi)) for p in best_to_worst[-5:] ])
+    """
+
+    #print "Features sorted by their score:"
+    #print "\n".join([ "%.4f %s" % (p[0], show_name(p[1],ncbi)) for p in sorted(zip(map(lambda x: round(x, 4), rf.feature_importances_), names), reverse=True) if p[0] > 0 ])
+
+    #cum_import=[ f + sum(rf.feature_importances_[:i]) for i,f in enumerate(rf.feature_importances_) if f > 0]
+    #print cum_import[:30]
+
+    #plt.plot(cum_import)
+    #plt.show()
+
 
     # prepare Kegg objects:
-    kegg_tree = kegg.KeggTree(config_d['kegg_f'],config_d['cbir_ko'])
+    #kegg_tree = kegg.KeggTree(config_d['kegg_f'],config_d['cbir_ko'])
 
     ###########################  TESTING SITE  #############################
 
-    genelist43 = list(set(["LOC105281428_Q","LOC105278524","LOC105280170","LOC105282036","LOC105275236","LOC105277456","LOC105283266","LOC105284141","LOC105285273","LOC105281340","LOC105286142","LOC105284539","LOC105279365","LOC105279366","LOC105275821","LOC105283812","LOC105287615","LOC105277435","LOC105287013","LOC105282105","LOC105285370","LOC105288082","LOC105287763","LOC105281770","LOC105285920","LOC105281330","LOC105279396","LOC105279397","LOC105285921","LOC105284974","LOC105275269","LOC105285466","LOC105280465","LOC105283721","LOC105275039","LOC105277654","LOC105275039","LOC105277654","LOC105285466","LOC105285597","LOC105288201","LOC105281757","LOC105277039","LOC105284284","LOC105287193","LOC105280785"]))
+    genelist43 = list(set(["LOC105281428_Q","LOC105278524","LOC105280170","LOC105282036","LOC105275236",
+        "LOC105277456","LOC105283266","LOC105284141","LOC105285273","LOC105281340",
+        "LOC105286142","LOC105284539","LOC105279365","LOC105279366","LOC105275821",
+        "LOC105283812","LOC105287615","LOC105277435","LOC105287013","LOC105282105",
+        "LOC105285370","LOC105288082","LOC105287763","LOC105281770","LOC105285920",
+        "LOC105281330","LOC105279396","LOC105279397","LOC105285921","LOC105284974",
+        "LOC105275269","LOC105285466","LOC105280465","LOC105283721","LOC105275039",
+        "LOC105277654","LOC105275039","LOC105277654","LOC105285466","LOC105285597",
+        "LOC105288201","LOC105281757","LOC105277039","LOC105284284","LOC105287193",
+        "LOC105280785"]))
     #genelist = list(cbir_df.index[:])
     #genelist = list(set(brsw_degs) - (set(meth_degs) & set(brsw_degs)))
     #genelist = list((set(brsw_degs) | set(meth_degs)) - (set(meth_degs) & set(brsw_degs)))
@@ -434,40 +677,86 @@ if __name__ == '__main__':
                         "LOC105284533","LOC105280170","LOC105279271",
                         ]))
 
-
-
-    combos = [((brsw_df,meth_df),"brsw PE scaled","meth PE scaled",
-                list(cbir_df.index[:]),list(set(brsw_degs)),
-                "Random","BrSw DEGs"),
-
-                ((cbir_df,sinv_ortho),"all Cbir scaled","Sinv scaled",
-                list(cbir_df.index[:]),
+    combos = [((brsw_vst, meth_vst),
+                "brsw PE vst","meth PE vst",
+                list(cbir_vst.index[:]),
                 list(set(allcbir)),
                 "Random","common to all cbir"),
 
-                ((cbir_df,acro_ortho),"all Cbir scaled","Acro scaled",
-                list(cbir_df.index[:]),
+                ((cbir_vst,sinv_ortho),
+                "all Cbir vst","Sinv vst",
+                list(cbir_vst.index[:]),
                 list(set(allcbir)),
                 "Random","common to all cbir"),
 
-                ((sinv_ortho, cbir_df),"Sinv scaled","all Cbir scaled",
-                list(cbir_df.index[:]),
-                list(set(sinv_degs)),
-                "Random","Sinv DEGs"),
+                ((dqua_ortho,sinv_ortho),
+                "Dqua","Sinv vst",
+                list(cbir_vst.index[:]),
+                list(set(allcbir)),
+                "Random","common to all cbir"),
 
-                ((sinv_ortho, acro_ortho),"Sinv scaled","acro scaled",
-                list(cbir_df.index[:]),
-                list(set(sinv_degs)),
-                "Random","Sinv DEGs"),
+                ((cbir_vst,acro_ortho),
+                "all Cbir vst","Acro vst",
+                list(cbir_vst.index[:]),
+                list(set(allcbir)),
+                "Random","common to all cbir"),
 
-                ((cbir_df,acro_ortho),"all PE scaled","Acro scaled",
-                list(cbir_df.index[:]),
+                ((cbir_vst, dqua_ortho),
+                "all Cbir vst","Dqua vst",
+                list(cbir_vst.index[:]),
+                list(set(allcbir)),
+                "Random","common to all cbir"),
+
+                ((sinv_ortho, cbir_vst),
+                "Sinv vst","all Cbir vst",
+                list(cbir_vst.index[:]),
+                list(set(allcbir)),
+                "Random","common to all cbir"),
+
+                ((dqua_ortho, cbir_vst),
+                "Dqua vst","all Cbir vst",
+                list(cbir_vst.index[:]),
+                list(set(allcbir)),
+                "Random","common to all cbir"),
+
+                ((sinv_ortho, acro_ortho),
+                "Sinv vst","acro vst",
+                list(cbir_vst.index[:]),
+                list(set(allcbir)),
+                "Random","common to all cbir"),
+
+                ((sinv_ortho, dqua_ortho),
+                "Sinv vst","Dqua vst",
+                list(cbir_vst.index[:]),
+                list(set(allcbir)),
+                "Random","common to all cbir"),
+
+                ((dqua_ortho, acro_ortho),
+                "Dqua vst","Acro vst",
+                list(cbir_vst.index[:]),
+                list(set(allcbir)),
+                "Random","common to all cbir"),
+
+                ((acro_ortho, cbir_vst),
+                "Acro vst","Cbir vst",
+                list(cbir_vst.index[:]),
+                list(set(allcbir)),
+                "Random","common to all cbir"),
+
+                ((acro_ortho, sinv_ortho),
+                "Acro vst","Sinv vst",
+                list(cbir_vst.index[:]),
+                list(set(allcbir)),
+                "Random","common to all cbir"),
+
+                ((acro_ortho, dqua_ortho),
+                "Acro vst","Dqua vst",
+                list(cbir_vst.index[:]),
                 list(set(allcbir)),
                 "Random","common to all cbir"),
 
 
             ]
-    # Generate random datasets to test performance:
 
     # set parameters:
     ####################################################
@@ -476,11 +765,12 @@ if __name__ == '__main__':
     #testing = "meth PE scaled"
     #
     #genelist1 = list(cbir_df.index[:])
-    #name1 = "Random"
-    #
     #genelist2 = list(set(brsw_degs))
+    #
+    #name1 = "Random"
     #name2 = "common DEGs(2 exp, 2 anal)"
     ####################################################
+
     if args.randomsets:
         pp=PdfPages(logfile[:-3] + 'pdf')
         for params in combos:
@@ -492,217 +782,13 @@ if __name__ == '__main__':
     if args.multitest:
         for params in combos:
             verbalise("B", params[1:3],params[5:])
-            multitest(reducedf(params[0][0], params[4]), params[0][1], name1=params[1] , name2=params[2], ffn=args.ffn, normtogether=False, normind=True, cv=args.cv)
+            multitest(params[0][0], params[0][1], degs=params[4],
+                        name1=params[1] , name2=params[2], ffn=args.ffn,
+                        normtogether=False, normind=True, cv=args.cv)
 
 
     ###########################  WINNING ANALYSES  #########################
-    """
-    combos = [((brsw_df,meth_df),"brsw PE scaled","meth PE scaled",
-                list(cbir_df.index[:]),list(set(brsw_degs)),
-                "Random","BrSw DEGs"),
 
-                ((meth_df,brsw_df),"meth PE scaled","brsw PE scaled",
-                list(cbir_df.index[:]),list(set(meth_degs)),
-                "Random","Meth DEGs"),
-
-                ((brsw_df,bsse_df),"brsw PE scaled","brsw SE scaled",
-                list(cbir_df.index[:]),list(set(brsw_degs)),
-                "Random","BrSw DEGs"),
-
-                ((meth_df,bsse_df),"meth PE scaled","brsw SE scaled",
-                list(cbir_df.index[:]),list(set(meth_degs)),
-                "Random","meth DEGs"),
-
-                ((bsse_df,brsw_df),"brsw SE scaled","brsw PE scaled",
-                list(cbir_df.index[:]),list(set(bsse_degs)),
-                "Random","BrSw DEGs"),
-
-                ((bsse_df,meth_df),"brsw SE scaled","meth PE scaled",
-                list(cbir_df.index[:]),list(set(bsse_degs)),
-                "Random","meth DEGs"),
-
-                ((brsw_df,sinv_ortho),"brsw PE scaled","Sinv scaled",
-                list(cbir_df.index[:]),list(set(brsw_degs)),
-                "Random","BrSw DEGs"),
-
-                ((meth_df,sinv_ortho),"meth PE scaled","Sinv scaled",
-                list(cbir_df.index[:]),list(set(meth_degs)),
-                "Random","Meth DEGs"),
-
-                ((bsse_df,sinv_ortho),"brsw SE scaled","Sinv scaled",
-                list(cbir_df.index[:]),list(set(bsse_degs)),
-                "Random","BSSE DEGs"),
-
-                ((cbir_df,sinv_ortho),"all PE scaled","Sinv scaled",
-                list(cbir_df.index[:]),list((set(brsw_degs)&set(meth_degs))),
-                "Random","common PE DEGs"),
-
-                ((cbir_df,sinv_ortho),"all PE scaled","Sinv scaled",
-                list(cbir_df.index[:]),
-                list((set(brsw_degs)|set(meth_degs))-(set(brsw_degs)&set(meth_degs))),
-                "Random","all - common PE DEGs"),
-
-                ((cbir_df,sinv_ortho),"all PE scaled","Sinv scaled",
-                list(cbir_df.index[:]),
-                list(set(ultimate)),
-                "Random","cbir & acro"),
-
-                ((cbir_df,sinv_ortho),"all PE scaled","Sinv scaled",
-                list(cbir_df.index[:]),
-                list(set(allcbir)),
-                "Random","common to all cbir"),
-
-                ((cbir_df,acro_ortho),"all PE scaled","Acro scaled",
-                list(cbir_df.index[:]),
-                list(set(allcbir)),
-                "Random","common to all cbir"),
-
-
-            ]
-    """
-
-
-    """
-        combos = [((brsw_df,meth_df),"brsw PE scaled","meth PE scaled",
-                list(cbir_df.index[:]),list(set(brsw_degs)),
-                "Random","BrSw DEGs"),
-
-                ((meth_df,brsw_df),"meth PE scaled","brsw PE scaled",
-                list(cbir_df.index[:]),list(set(meth_degs)),
-                "Random","Meth DEGs"),
-
-                ((brsw_df,bsse_df),"brsw PE scaled","brsw SE scaled",
-                list(cbir_df.index[:]),list(set(brsw_degs)),
-                "Random","BrSw DEGs"),
-
-                ((meth_df,bsse_df),"meth PE scaled","brsw SE scaled",
-                list(cbir_df.index[:]),list(set(meth_degs)),
-                "Random","meth DEGs"),
-
-                ((cbir_df,bsse_df),"all PE scaled","brsw SE scaled",
-                list(cbir_df.index[:]),list((set(brsw_degs)|set(meth_degs))),
-                "Random","all PE DEGs"),
-
-                ((cbir_df,bsse_df),"all PE scaled","brsw SE scaled",
-                list(cbir_df.index[:]),list((set(brsw_degs)&set(meth_degs))),
-                "Random","common PE DEGs"),
-
-                ((cbir_df,bsse_df),"all PE scaled","brsw SE scaled",
-                list((set(brsw_degs)|set(meth_degs))),
-                list((set(brsw_degs)|set(meth_degs))-(set(brsw_degs)&set(meth_degs))),
-                "all PE DEGs","all - common PE DEGs"),
-
-                ((cbir_df,bsse_df),"all PE scaled","brsw SE scaled",
-                list(cbir_df.index[:]),
-                list((set(brsw_degs)|set(meth_degs))-(set(brsw_degs)&set(meth_degs))),
-                "Random","all - common PE DEGs"),
-
-                ((brsw_df,meth_df),"brsw PE scaled","meth PE scaled",
-                list(cbir_df.index[:]),
-                list((set(brsw_degs)|set(meth_degs))-(set(brsw_degs)&set(meth_degs))),
-                "Random","all - common PE DEGs"),
-
-                ((brsw_df,meth_df),"brsw PE scaled","meth PE scaled",
-                list((set(brsw_degs)|set(meth_degs))),
-                list((set(brsw_degs)|set(meth_degs))-(set(brsw_degs)&set(meth_degs))),
-                "all PE DEGs","all - common PE DEGs"),
-
-                ((cbir_df,acro_ortho),"C.biroi PE scaled","Acromyrmex scaled",
-                list(cbir_df.index[:]), allcbir,
-                "Random","188 cbir"),
-            ]
-
-    """
-
-
-    """
-        combos = [((brsw_df,meth_df),"brsw PE scaled","meth PE scaled",
-                list(cbir_df.index[:]),list(set(brsw_degs)),
-                "Random","BrSw DEGs"),
-
-                ((meth_df,brsw_df),"meth PE scaled","brsw PE scaled",
-                list(cbir_df.index[:]),list(set(meth_degs)),
-                "Random","Meth DEGs"),
-
-                ((brsw_df,bsse_df),"brsw PE scaled","brsw SE scaled",
-                list(cbir_df.index[:]),list(set(brsw_degs)),
-                "Random","BrSw DEGs"),
-
-                ((meth_df,bsse_df),"meth PE scaled","brsw SE scaled",
-                list(cbir_df.index[:]),list(set(meth_degs)),
-                "Random","meth DEGs"),
-
-                ((cbir_df,bsse_df),"all PE scaled","brsw SE scaled",
-                list(cbir_df.index[:]),list((set(brsw_degs)|set(meth_degs))),
-                "Random","all PE DEGs"),
-
-                ((cbir_df,bsse_df),"all PE scaled","brsw SE scaled",
-                list(cbir_df.index[:]),list((set(brsw_degs)&set(meth_degs))),
-                "Random","common PE DEGs"),
-
-                ((cbir_df,bsse_df),"all PE scaled","brsw SE scaled",
-                list((set(brsw_degs)|set(meth_degs))),
-                list((set(brsw_degs)|set(meth_degs))-(set(brsw_degs)&set(meth_degs))),
-                "all PE DEGs","all - common PE DEGs"),
-
-                ((cbir_df,bsse_df),"all PE scaled","brsw SE scaled",
-                list(cbir_df.index[:]),
-                list((set(brsw_degs)|set(meth_degs))-(set(brsw_degs)&set(meth_degs))),
-                "Random","all - common PE DEGs"),
-
-                ((brsw_df,meth_df),"brsw PE scaled","meth PE scaled",
-                list(cbir_df.index[:]),
-                list((set(brsw_degs)|set(meth_degs))-(set(brsw_degs)&set(meth_degs))),
-                "Random","all - common PE DEGs"),
-
-                ((brsw_df,meth_df),"brsw PE scaled","meth PE scaled",
-                list((set(brsw_degs)|set(meth_degs))),
-                list((set(brsw_degs)|set(meth_degs))-(set(brsw_degs)&set(meth_degs))),
-                "all PE DEGs","all - common PE DEGs"),
-    ]
-    """
-
-
-
-    """
-    pairwisecombinations=[(brsw_df.loc[brsw_degs],meth_df,"Broodswap","Methylation PE",6),
-    (brsw_df.loc[brsw_degs],bsse_df,"Broodswap","Broodswap SE",6),
-    (brsw_df.loc[brsw_degs],acro_ortho,"Broodswap","Acromyrmex heads",6),
-    (brsw_df.loc[brsw_degs],polk_ortho,"Broodswap","Polistes F13",6),
-    (meth_df.loc[meth_degs],brsw_df,"Methylation","Broodswap",4),
-    (meth_df.loc[meth_degs],bsse_df,"Methylation","Broodswap SE",4),
-    (meth_df.loc[meth_degs],acro_ortho,"Methylation","Acromyrmex heads",4),
-    (meth_df.loc[meth_degs],polk_ortho,"Methylation","Polistes F13",4),
-    (cbir_df.loc[set(brsw_degs.keys() + meth_degs.keys())],bsse_df,"Broodswap + Methylation","Broodswap SE",5),
-    (cbir_df.loc[set(brsw_degs.keys() + meth_degs.keys())],acro_ortho,"Broodswap + Methylation","Acromyrmex heads",5),
-    (cbir_df.loc[set(brsw_degs.keys() + meth_degs.keys())],polk_ortho,"Broodswap + Methylation","Polistes F13",5),
-    (index_orthos(acro_df.loc[acro_degs], convert_orthos), cbir_df.loc[set(brsw_degs.keys() + meth_degs.keys())], "Acromyrmex heads", "Cerapachys controls",3),
-    ]
-
-    for df1, df2, name1, name2, cv in pairwisecombinations:
-        weights, rfes, rfecvs, dfindex = multitest(
-                df1, df2,
-                name1,name2,
-                ffn=5, cv=cv, normtogether=False, normind=True)
-        report_genes(weights, rfes, rfecvs, dfindex, 10)
-    """
-
-
-    """
-    # Generate random datasets to test performance:
-    genelist = list(cbir_df.index[:])
-
-    all_scores = []
-    for i in range(1000):
-        random.shuffle(genelist)
-        random_set = genelist[:5]
-        X1, y1, X2, y2, dfindex = create_xy(cbir_df.loc[random_set], bsse_df)
-        weight, score = predictor_svm(X1, y1, X2, y2)
-        all_scores.append(score)
-
-    plt.hist(all_scores, bins=24)
-    plt.show()
-    """
 
 
     """
