@@ -51,8 +51,8 @@ def define_arguments():
     parser.add_argument("-s", "--small_term", type=str, default='protein_id',
                         help = "the term to replace from. (Default='protein_id'")
     parser.add_argument("-a", "--addname", type=str, default='gene',
-                        help = """In the specified gff file, replace the large term in
-                        the specified level with the small term""")
+                        help = """In the gff file, at the specified level [default=gene]
+                        replace the large term with the small term""")
 
 
 
@@ -126,7 +126,9 @@ def replace_fasta(isodic, fasta, outfile):
     outhandle.close()
     handle.close()
 
-def findlongest(gff, pepfile, species_key, pattern='(gb|ref)\|([^\|]+)\|'):
+def findlongest(gff, pepfile, species_key, logfile="", pattern='(gb|ref)\|([^\|]+)\|'):
+    if logfile == "":
+        logfile = gff
     print "Searching using pattern %r" % pattern
     isolen = {}
     err_cnt = 0
@@ -139,7 +141,7 @@ def findlongest(gff, pepfile, species_key, pattern='(gb|ref)\|([^\|]+)\|'):
             cdstart = int(line.split()[3])
             cdstop = int(line.split()[4])
             attr = { term.split('=')[0]:term.split('=')[1] for term in " ".join(line.split()[8:]).split(';')  }
-            
+
             if 'gene' in attr:
                 gene = attr['gene']
             elif 'Name' in attr:
@@ -147,7 +149,7 @@ def findlongest(gff, pepfile, species_key, pattern='(gb|ref)\|([^\|]+)\|'):
             else:
                 err_cnt += 1
                 continue
-            
+
             if 'protein_id' in attr:
                 mrna = attr['protein_id']
             elif 'transcript_id' in attr:
@@ -155,7 +157,7 @@ def findlongest(gff, pepfile, species_key, pattern='(gb|ref)\|([^\|]+)\|'):
             else:
                 err_cnt += 1
                 continue
-            
+
             if gene not in isolen:
                 isolen[gene] = { mrna:abs(cdstart-cdstop) }
             elif mrna not in isolen[gene]:
@@ -194,7 +196,7 @@ def findlongest(gff, pepfile, species_key, pattern='(gb|ref)\|([^\|]+)\|'):
     print pepseq.keys()[:5]
 
     # write longest peptide sequences to fasta file:
-    longest = gff[:-4]+"longest.pep"
+    longest = logfile[:-4]+"_longest.pep"
     verbalise("Y", "writing longests sequences to ", longest)
     longest_h = open(longest, 'w')
     for gene in isolen:
@@ -204,7 +206,7 @@ def findlongest(gff, pepfile, species_key, pattern='(gb|ref)\|([^\|]+)\|'):
                 try:
                     longest_h.write(pepseq[isoform] + "\n")
                 except KeyError:
-                    print isoform
+                    print "Error. Could not find isoform", isoform
                     continue
                 break
 
@@ -291,6 +293,8 @@ def replace_gff(isodic, gff_file, outfile,
 
     for line in handle:
         cols = line.split()
+        if len(cols) < 9:
+            continue
         if cols[2] == level:
             atts = attr(line)
             if idbig in atts:
@@ -340,7 +344,7 @@ if __name__ == '__main__':
         verbalise( len(genedic), genedic.keys()[:5], genedic.values()[:5] )
         verbalise( sum( 1 for val in genedic if len(genedic[val]) > 1) )
     elif args.find_longest:
-        findlongest(args.gff, args.fasta, args.speckey, pattern=args.pattern)
+        findlongest(args.gff, args.fasta, args.speckey, logfile, pattern=args.pattern)
     elif args.replace:
         verbalise("building isoform dictionary")
         isodic = build_isodic(args.gff, idbig=args.large_term, idsmall=args.small_term)
