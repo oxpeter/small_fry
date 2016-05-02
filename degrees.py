@@ -19,6 +19,8 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import Image, ImageDraw, ImageFont # for saving the venn diagram
 import seaborn as sns
+from scipy.cluster import hierarchy
+from scipy.spatial import distance
 
 from genomepy import config
 import brain_machine as bm
@@ -64,26 +66,40 @@ def define_arguments():
     # analysis options
     parser.add_argument("-L", "--list_genes", action='store_true',
                         help="""list all common significant genes.""")
+    parser.add_argument('-n', '--name_genes', type=str,
+                        help="""provide a file to convert gene loci to names.""")
     parser.add_argument("-A", "--findall", action='store_true',
                         help="""find all significant concordant genes between given
                         datasets""")
 
+
+
     return parser
 
-
-
 def fetch_orthologs(orthofile, mustcontain=None, exclude=None):
+    """
+    Uses orthomcl's mcl output file to collect all appropriate ortholog groups. The
+    dictionary created will only add groups when all members of the 'mustcontain' list
+    are present, and when only a single representative of each present member exists,
+    unless it is in the 'exclude' list, in which case any number of instances can be
+    present.
+
+    ortho_dic keys will be the gene name, and the values will be the ortholog name
+    ortho_idx keys will be the ortholog name, and the values will be a list of all members
+    """
     handle = open(orthofile, 'rb')
     verbalise("M", "Converting from file", orthofile)
     ortho_dic = {}
+    ortho_idx = {}
     for line in handle:
         cols = line.split()
         if len(cols) > 0:
+            ortho_idx[cols[0]] = cols[1:]
             counts = collections.Counter()
             for g in cols:
                 spec = g.split('|')[0]
                 if spec in exclude:
-                    continue
+                    counts[spec] = 1 # coerce to an acceptable number.
                 else:
                     counts[spec] += 1
             if mustcontain:
@@ -100,9 +116,14 @@ def fetch_orthologs(orthofile, mustcontain=None, exclude=None):
                 ortho_dic.update({ g:cols[0] for g in cols })
     handle.close()
 
-    return ortho_dic
+    return ortho_dic, ortho_idx
 
 def translate_to_orthologs(degfile, orthodic):
+    """
+    Takes the DESeq2 output file with genes, log2(fold change) and p-values, and
+    creates a dictionary where the gene name is converted to the ortholog group name,
+    to allow comparison between species.
+    """
     degdic = {}
     handle = open(degfile, 'rb')
     for line in handle:
@@ -281,6 +302,30 @@ def draw_circles(c1t,c2t,c3t,c4t,o1t,o2t,o3t,o4t,l1t,l2t,l3t,l4t, outfile="venn.
 
     return outfile
 
+def distance_tree(array, outfile, metric='euclidean', method='complete',
+                    basis="shared degs"):
+
+    verbalise("C", "%s" % (basis))
+    verbalise(str(array))
+    print "\n"
+
+    inverse = 1 / array
+    zeroed  = inverse.fillna(0)
+    Y  = distance.pdist(zeroed, metric)
+    Z  = hierarchy.linkage(Y, method=method, metric=metric)
+
+    plt.figure(figsize=(10,7))
+    hierarchy.dendrogram(Z,
+                        leaf_rotation=90.,
+                        leaf_font_size=8.,
+                        labels=array.columns)
+    plt.title(
+        "Distances based on %s \n(%s distance tree, %s clustering)" % (
+                        basis, metric, method)
+              )
+    plt.ylabel("Distance")
+    plt.savefig(outfile, format='pdf')
+    plt.show()
 
 
 ########################################################################################
@@ -292,6 +337,7 @@ if __name__ == '__main__':
     verbalise = config.check_verbose(not(args.quiet))
     logfile = config.create_log(args, outdir=args.directory, outname=args.output)
 
+    # check all input files can be found
     stop = False
     for f in args.experiments:
         if not os.path.isfile(f):
@@ -300,6 +346,7 @@ if __name__ == '__main__':
     if stop:
         sys.exit(1)
 
+    # set up lists of species that must be included or can be ignored in ortholog groups
     if args.exclude:
         exclusions = args.exclude.split(',')
     else:
@@ -311,20 +358,38 @@ if __name__ == '__main__':
         necessary = None
 
     print "\nOrtholog file must contain:", args.mustcontain
-    orthodic = fetch_orthologs(args.orthologs[0],
-                                mustcontain=necessary,
-                                exclude=exclusions)
+    orthodic, ortho_idx = fetch_orthologs(args.orthologs[0],
+                                            mustcontain=necessary,
+                                            exclude=exclusions)
     verbalise("G", "%d unique ortholog groups were found" % len(orthodic.items()))
 
 
     if len(args.experiments) > 2:
-        # initialise containers:
+        ######## initialise containers #########
+        # for storing pairwise shared DEGs:
         concordant_array = pd.DataFrame(
                 None,
                 index=[os.path.basename(e)[:5] for e in args.experiments],
                 columns=[os.path.basename(e)[:5] for e in args.experiments]
                 )
+        # for storing pairwise correlation of log2(fold change):
+        correl_array = pd.DataFrame(
+                None,
+                index=[os.path.basename(e)[:5] for e in args.experiments],
+                columns=[os.path.basename(e)[:5] for e in args.experiments]
+                )
+
+        # for storing (inverse) jaccard's index of DEGs:
+        jaccard_array = pd.DataFrame(
+                None,
+                index=[os.path.basename(e)[:5] for e in args.experiments],
+                columns=[os.path.basename(e)[:5] for e in args.experiments]
+                )
+
+
         concordant_sig_genesets = []
+
+        # for storing graphs and charts:
         pdfhandle = PdfPages(logfile[:-3] + "barcharts.pdf")
         all_pngs = []
 
@@ -362,6 +427,7 @@ if __name__ == '__main__':
             df3 = df1.join(df2, how='left', lsuffix="1st").dropna()
             label1 = os.path.basename(exp1)[:5]
             label2 = os.path.basename(exp2)[:5]
+            correlation = df3['logfc'].corr(df3['logfc1st'], method='spearman')
 
             # get genes that are significant in both experiements and their direction:
             df1_sp = set(df3[(df3.padj1st<=0.05) & (df3.logfc1st>0)].index)
@@ -374,13 +440,27 @@ if __name__ == '__main__':
             df1_nsn = set(df3[(df3.padj1st>0.05) & (df3.logfc1st<0)].index)
             df2_nsn = set(df3[(df3.padj   >0.05) & (df3.logfc   <0)].index)
 
-            # report output
-            verbalise(
-    "B",
+            ######### analyse pairwise gene sets #######
+            # find numbers of concordant and discordant genes:
+            concordance_sets = concordancecounts(df1_sp, df2_sp, df1_sn, df2_sn,
+                              df1_nsp, df2_nsp, df1_nsn, df2_nsn)
+            concordant_sig_genesets.append(concordance_sets[0])
+            concordant_array[label1].loc[label2] = len(concordance_sets[0])
+
+            # find inverse of jaccard's index for significant genes:
+            ijidx = 1. *(len(df1_sp | df1_sn) + len(df2_sp | df2_sn) - len(concordance_sets[0])) / \
+                    (len(df1_sp | df1_sn) + len(df2_sp | df2_sn) - 2 * len(concordance_sets[0]))
+            jaccard_array[label1].loc[label2] = ijidx
+
+            # find correlation of log2(fold change):
+            correl_array[label1].loc[label2] = correlation
+
+            ########## report output ###################
+            verbalise("B",
     "\n\n%s (%d orthologs, er=%.1f) vs\n%s (%d orthologs, er=%.1f) : %d shared orthologs" % (
-                         label1.upper(), len(df1), r1,
-                         label2.upper(), len(df2), r2,
-                         len(df3))
+                     label1.upper(), len(df1), r1,
+                     label2.upper(), len(df2), r2,
+                     len(df3))
                       )
             verbalise("G", "%s: %d significant and pos" % (label1, len(df1_sp)))
             verbalise("G", "%s: %d significant and neg" % (label1, len(df1_sn)))
@@ -388,13 +468,6 @@ if __name__ == '__main__':
             verbalise("C", "%s: %d significant and pos" % (label2, len(df2_sp)))
             verbalise("C", "%s: %d significant and neg" % (label2, len(df2_sn)))
             verbalise("C", "%s: %d all significant    " % (label2, len(df2_sp | df2_sn)))
-
-            concordance_sets = concordancecounts(df1_sp, df2_sp, df1_sn, df2_sn,
-                              df1_nsp, df2_nsp, df1_nsn, df2_nsn)
-
-            concordant_sig_genesets.append(concordance_sets[0])
-
-            concordant_array[label1].loc[label2] = len(concordance_sets[0])
             verbalise("Y", "concordant DEGs = ", len(concordance_sets[0]))
 
             # create graphs of overlapping DEGs:
@@ -420,7 +493,8 @@ if __name__ == '__main__':
 
         # collate images, close output files and cleanup:
         pdfhandle.close()
-        # convert is from the imagemagick ubuntu install
+
+        # convert is from the ImageMagick ubuntu install
         status = subprocess.call(
                 ["convert"] + all_pngs + ["%svenn_diagrams.pdf" % logfile[:-3]]
                                 )
@@ -429,21 +503,52 @@ if __name__ == '__main__':
 
         ########### SUMMARY OF ALL DATASETS ###########
         common_to_all = set.intersection(*concordant_sig_genesets)
+
+        # calculate distance based on number of shared DEGs:
+        distance_tree(concordant_array,
+                        "%sdeg_tree.pdf" % logfile[:-3],
+                        metric='euclidean',
+                        method='single',
+                        basis="number of concordant DEGs")
+
+        # calculate distance based on jaccard's index of DEGs:
+        distance_tree(jaccard_array,
+                        "%sjaccards_tree.pdf" % logfile[:-3],
+                        metric='euclidean',
+                        method='single',
+                        basis="Jaccard's index of DEGs")
+
+        # calculate distance based on log2(fold change)
+        distance_tree(correl_array,
+                        "%slog2fc_correl_tree.pdf" % logfile[:-3],
+                        metric='euclidean',
+                        method='single',
+                        basis="correlation of log2(fold change)")
+
         verbalise("R", "\nThere are %d genes common to all datasets" % len(common_to_all))
 
-
-        print concordant_array
-        #TODO: take this array and calculate distances between species
     else:
         verbalise("R", "Insufficient output files were provided")
+        sys.exit(1)
 
     if args.list_genes:
-        """
-        ncbi = bm.ncbi_dic(args.list_genes)
-        genelist = open(logfile[:-3] + "concordantgenes.list", 'w')
-        genelist.write("\n".join([bm.show_name(loc, ncbi) for loc in common_to_all]))
-        genelist.close()
-        print "\n".join([bm.show_name(loc, ncbi) for loc in common_to_all])
-        """
+        if args.name_genes:     # create dictionary for finding gene names
+            name_chart = {}
+            handle = open(args.name_genes, 'rb')
+            for line in handle:
+                cols = line.split()
+                name_chart[cols[0]] = " ".join(cols[1:])
+            handle.close()
+
+
         for o in common_to_all:
-            verbalise("Y", o)
+            name = "---"
+            if args.name_genes:
+                if o in ortho_idx:
+                    for gene in ortho_idx[o]:
+                        if gene[5:] in name_chart:
+                            name = name_chart[gene[5:]]
+
+            if name == "---":
+                name = "Includes: %s" % " ".join(ortho_idx[o][:3])
+            verbalise("Y", "%20s %s" % (o, name))
