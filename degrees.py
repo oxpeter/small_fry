@@ -23,6 +23,7 @@ from scipy.cluster import hierarchy
 from scipy.spatial import distance
 
 from genomepy import config
+from genomepy.genematch import Fisher_square, p_to_q
 import brain_machine as bm
 
 ########################################################################################
@@ -36,7 +37,7 @@ def define_arguments():
                         help="specify the filename to save results to")
     parser.add_argument("-d", "--directory", type=str,
                         help="specify the directory to save results to")
-    parser.add_argument("-v", "--visible", action='store_true',default=False,
+    parser.add_argument("-D", "--display", action='store_true',default=False,
                         help="show charts and graphs")
     parser.add_argument("-q", "--quiet", action='store_true',default=False,
                         help="don't print messages")
@@ -71,7 +72,9 @@ def define_arguments():
     parser.add_argument("-A", "--findall", action='store_true',
                         help="""find all significant concordant genes between given
                         datasets""")
-
+    parser.add_argument('-e', '--enrichment', type=str,
+                        help="""provide a .obo file to perform GO term enrichment on the
+                        common orthologs.""")
 
 
     return parser
@@ -86,6 +89,8 @@ def fetch_orthologs(orthofile, mustcontain=None, exclude=None):
 
     ortho_dic keys will be the gene name, and the values will be the ortholog name
     ortho_idx keys will be the ortholog name, and the values will be a list of all members
+
+    ortho_idx is not the strict subset that matches all necessary and exclusionary criteria!
     """
     handle = open(orthofile, 'rb')
     verbalise("M", "Converting from file", orthofile)
@@ -303,7 +308,7 @@ def draw_circles(c1t,c2t,c3t,c4t,o1t,o2t,o3t,o4t,l1t,l2t,l3t,l4t, outfile="venn.
     return outfile
 
 def distance_tree(array, outfile, metric='euclidean', method='complete',
-                    basis="shared degs"):
+                    basis="shared degs", display=True):
 
     verbalise("C", "%s" % (basis))
     verbalise(str(array))
@@ -325,8 +330,10 @@ def distance_tree(array, outfile, metric='euclidean', method='complete',
               )
     plt.ylabel("Distance")
     plt.savefig(outfile, format='pdf')
-    plt.show()
-
+    if display:
+        plt.show()
+    else:
+        plt.close()
 
 ########################################################################################
 
@@ -361,8 +368,8 @@ if __name__ == '__main__':
     orthodic, ortho_idx = fetch_orthologs(args.orthologs[0],
                                             mustcontain=necessary,
                                             exclude=exclusions)
-    verbalise("G", "%d unique ortholog groups were found" % len(orthodic.items()))
-
+    verbalise("G", "%d genes were indexed in %d ortholog groups" % (len(orthodic),
+                                                                    len(ortho_idx) ))
 
     if len(args.experiments) > 2:
         ######## initialise containers #########
@@ -480,7 +487,7 @@ if __name__ == '__main__':
                         concord_n, discord_1p,
                         label1+" pos", label2+" pos", label1+" neg", label2+" neg",
                         outfile= "%s%s_%s.venn.png" % (logfile[:-3],label1,label2 ),
-                        visible=args.visible  )
+                        visible=args.display  )
 
             all_pngs.append(outpng) # will be concatenated into a single pdf later.
             concordance_sets = concordancecounts(df1_sp, df2_sp, df1_sn, df2_sn,
@@ -489,7 +496,7 @@ if __name__ == '__main__':
                         bkgd_freq=concordance_sets[-1],
                         label1=label1, label2=label2,
                         outfile=pdfhandle,
-                        visible=args.visible )
+                        visible=args.display )
 
         # collate images, close output files and cleanup:
         pdfhandle.close()
@@ -509,21 +516,24 @@ if __name__ == '__main__':
                         "%sdeg_tree.pdf" % logfile[:-3],
                         metric='euclidean',
                         method='single',
-                        basis="number of concordant DEGs")
+                        basis="number of concordant DEGs",
+                        display=args.display)
 
         # calculate distance based on jaccard's index of DEGs:
         distance_tree(jaccard_array,
                         "%sjaccards_tree.pdf" % logfile[:-3],
                         metric='euclidean',
                         method='single',
-                        basis="Jaccard's index of DEGs")
+                        basis="Jaccard's index of DEGs",
+                        display=args.display)
 
         # calculate distance based on log2(fold change)
         distance_tree(correl_array,
                         "%slog2fc_correl_tree.pdf" % logfile[:-3],
                         metric='euclidean',
                         method='single',
-                        basis="correlation of log2(fold change)")
+                        basis="correlation of log2(fold change)",
+                        display=args.display)
 
         verbalise("R", "\nThere are %d genes common to all datasets" % len(common_to_all))
 
@@ -531,6 +541,8 @@ if __name__ == '__main__':
         verbalise("R", "Insufficient output files were provided")
         sys.exit(1)
 
+
+    # list all orthologs that were concordantly expressed in all pairwise comparisons:
     if args.list_genes:
         if args.name_genes:     # create dictionary for finding gene names
             name_chart = {}
@@ -552,3 +564,89 @@ if __name__ == '__main__':
             if name == "---":
                 name = "Includes: %s" % " ".join(ortho_idx[o][:3])
             verbalise("Y", "%20s %s" % (o, name))
+
+
+    # perform Fisher's Exact Test for enrichment of Pfam domains in the orthologs that
+    # were concordantly expressed in all pairwise comparisons
+    if args.enrichment:
+        background_set_size = len(df3)
+        background_gene_set = { g[5:]:True for o in df3.index for g in ortho_idx[o]}
+        background_gene_set.update({ g:True for o in df3.index for g in ortho_idx[o]})
+
+
+        # create pfam indices:
+        pfam_idx = {}   # store all genes that contain a given pfam acc.
+        pfam_ref = {}   # store definitions of pfam accession numbers
+        pfam_acc = {}   # store all pfams for a given gene
+
+        handle = open(args.enrichment, 'rb')
+        for line in handle:
+            cols = line.split()
+
+            # skip all null lines:
+            if len(cols) == 0:
+                continue
+            elif line[0] == '#':
+                continue
+
+            # add to all the indices
+            if cols[1] not in pfam_ref:
+                pfam_ref[cols[1]] = " ".join(cols[22:])
+                pfam_idx[cols[1]] = []
+
+            if cols[3] not in pfam_acc:
+                pfam_acc[cols[3]] = []
+
+            pfam_idx[cols[1]].append(cols[3])
+            pfam_acc[cols[3]].append(cols[1])
+
+        handle.close()
+
+        ### create fisher squares for all concordant common orthologs:
+
+        # create key sets and counters:
+        common_pfams = set()
+        fs = [] # contains all the fishers tests
+
+        # collect all pfams in the CCOs:
+        deg_pfam_counter = collections.Counter()
+        for o in common_to_all:
+            for gene in ortho_idx[o]:
+                if gene[5:] in pfam_acc:
+                    common_pfams.update(pfam_acc[gene[5:]])
+                    deg_pfam_counter.update(set(pfam_acc[gene[5:]]))
+                    break
+                elif gene in pfam_acc:
+                    common_pfams.update(pfam_acc[gene])
+                    deg_pfam_counter.update(set(pfam_acc[gene]))
+                    break
+
+        # count occurrences of pfam in each category
+        for pfam in common_pfams:
+            degs_w_pfam  = deg_pfam_counter[pfam]
+            degs_wo_pfam = len(common_to_all) - degs_w_pfam
+            nogs_w_pfam  = sum( 1 for g in pfam_idx[pfam] if g in background_gene_set) - degs_w_pfam
+            nogs_wo_pfam = background_set_size - len(common_to_all) - nogs_w_pfam
+
+            fs.append(Fisher_square(TwG=degs_w_pfam,
+                                    TwoG=degs_wo_pfam,
+                                    NwG=nogs_w_pfam,
+                                    NwoG=nogs_wo_pfam,
+                                    id=pfam,
+                                    id_info="%s (%s)" % (pfam, pfam_ref[pfam]) )
+                    )
+
+        for s in fs:
+            s.fisher_test()
+        pvals = [ s.p for s in fs ]
+        fdr = p_to_q(pvals, alpha=0.05, method='fdr_bh')
+        verbalise("M", "%d pfam domains found in concordant common orthologs" % (len(s)))
+
+        for s in fs:
+            if s.p in fdr:
+                if fdr[s.p] <= 0.05 and s.TwG > 1:
+                    verbalise("C", s)
+                    verbalise("M", "FDR = %.3f" % fdr[s.p])
+            elif s.p <= 0.05 and s.TwG > 1:
+                verbalise("C", s)
+                verbalise("M", "FDR not determined for P-value %r" % s.p)
