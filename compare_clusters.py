@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
 """
 module used to compare gene clusters between forg to stat and stat to forg
