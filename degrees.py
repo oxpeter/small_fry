@@ -554,7 +554,7 @@ if __name__ == '__main__':
 
             # get number of genes concordantly expressed (significant or not)
             num_concord = len(df3[((df3.logfc1st > 0) & (df3.logfc > 0)) |
-                                  ((df3.logfc1st > 0) & (df3.logfc > 0))])
+                                  ((df3.logfc1st < 0) & (df3.logfc < 0))])
             all_conc_array[label1].loc[label2] = num_concord
 
             # get number of genes concordantly expressed (significant in at least one)
