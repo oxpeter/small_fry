@@ -105,6 +105,8 @@ class KeggTree(object):
     def list_keggs(self, pathway, terms=False, convert=False):
         if pathway in self.pathways:
             keggs = self.pathways[pathway]
+        else:
+            keggs = []
         if terms:
             keggs = [self.kegg_name(k) for k in keggs[:]]
         elif convert:
@@ -114,10 +116,13 @@ class KeggTree(object):
         return keggs
 
     def list_pathways(self, pathway_group, terms=False):
-        if pathway in self.pathway_groups:
-            keggs = self.pathway_groups[pathway]
+        if pathway_group in self.pathway_groups:
+            keggs = self.pathway_groups[pathway_group]
+        else:
+            keggs = []
         if terms:
             keggs = [self.pathway_name(k) for k in keggs[:]]
+
         return keggs
 
     def kegg_name(self, kegg):
@@ -166,24 +171,35 @@ class KeggTree(object):
 def define_arguments():
     parser = argparse.ArgumentParser(description=
             "Performs various searches on the KEGG orthologs and pathways")
-
-    # input options
-    parser.add_argument("-k", "--listkeggs", type=str,
-                        help="get Cbir genes for given KEGG pathway")
-    parser.add_argument("-p", "--listpathways", type=str,
-                        help="list kegg pathways for given pathway group")
-
-    parser.add_argument("-s", "--search", type=str,
-                        help="search pathways for match to string")
-    parser.add_argument("-l", "--level", type=str,
-                        help="level for pathway search (A, B or C)")
-
-    parser.add_argument("-o", "--output", type=str, default='lorf2.out',
+    # basic logging:
+    parser.add_argument("-o", "--output", type=str, default='KEGG',
                         help="specify the filename to save results to")
     parser.add_argument("-d", "--directory", type=str,
                         help="specify the directory to save results to")
     parser.add_argument("-q", "--quiet", action='store_true',default=False,
                         help="don't print messages")
+
+    # input options:
+    parser.add_argument("-k", "--listkeggs", type=str,
+                        help="""get KEGG orthologs for given KEGG pathway
+                        Input KEGG path as number (e.g. 04612)""")
+    parser.add_argument("-p", "--listpathways", type=str,
+                        help="""list kegg pathways for given major pathway group
+                        (e.g. Circulatory, Excretory, Immune, Transcription, Cell)""")
+    parser.add_argument("--define", type=str,
+                        help=""" Get the definition for a given list of KEGG orthologs.
+                        """)
+    parser.add_argument("-s", "--search", type=str,
+                        help="search pathways for match to string")
+    parser.add_argument("-l", "--level", type=str,
+                        help="level for pathway search (A, B or C)")
+
+    parser.add_argument("kegg_hierarchy", nargs=1,
+                        help="""the KEGG hierarchy file.""")
+    parser.add_argument("kegg_orthologs", nargs=1,
+                        help="""the file showing the genes and their KEGG orthologs.
+                        the file should contain two columns. The first is the gene name,
+                        the second is the KEGG ortholog""")
 
     return parser
 
@@ -199,7 +215,6 @@ def cbir_tree(cbir_ko):
                 cbir_dic[cols[1]] = [cols[0]]
     return cbir_dic
 
-
 def load_config(config_f):
     config_h = open(config_f, 'rb')
     config_d = { line.split()[0]:line.split()[1] for line in config_h if line[0]!='#'}
@@ -208,50 +223,91 @@ def load_config(config_f):
 
 
 
-
-
-
 if __name__ == '__main__':
-    if len(sys.argv)<2:
-        print "Please supply the config file in the command line"
-        exit()
-
-    config_d = load_config(sys.argv[1])
-
-    kegg_f = config_d['kegg_f']   # location of .keg file (KEGG hierarchy)
-    cbir_ko = config_d['cbir_ko'] # location of gene - kegg ortholog list
 
     parser = define_arguments()
     args = parser.parse_args()
+
+    kegg_f = args.kegg_hierarchy[0]   # location of .keg file (KEGG hierarchy)
+    cbir_ko = args.kegg_orthologs[0] # location of gene - kegg ortholog list
 
     verbalise = config.check_verbose(not(args.quiet))
     logfile = config.create_log(args, outdir=args.directory, outname=args.output)
 
     kegg_tree = KeggTree(kegg_f, cbir_ko)
-    #cbir_dic = cbir_tree(cbir_ko)
+
+
+    #print "top_trees\n", kegg_tree.top_trees.items()[:5]                 # A level
+    #print "pathway_groups\n", kegg_tree.pathway_groups.items()[:5]            # B level
+    #print "pathway_groups_rev\n", kegg_tree.pathway_groups_rev.items()[:5]       # B level
+    #print "pathway_groups_keggs_rev\n", kegg_tree.pathway_groups_keggs_rev.items()[:5]  # B level
+    #print "pathways\n", kegg_tree.pathways.items()[:5]               # C level
+    #print "pathways_rev\n", kegg_tree.pathways_rev.items()[:5]             # C level
+    #print "pathways_terms\n", kegg_tree.pathways_terms.items()[:5]            # C level
+    #print "kegg_terms\n", kegg_tree.kegg_terms.items()[:5]              # D level
+    #print "cbir_dic\n", kegg_tree.cbir_dic.items()[:5] # for converting to cbir loci
 
     if args.listkeggs:
-        # get all keggs from given pathway:
-        genes = kegg_tree.list_keggs(args.listkeggs, convert=True)
-        print genes
-        # convert to cbir genes:
-        #genes = []
-        #for k in keggs:
-        #    try:
-        #        genes += cbir_dic[k]
-        #    except KeyError:
-        #        pass
-        verbalise("M", "%d genes in pathway %s (%s)" % ( len(genes), args.listkeggs, kegg_tree.pathway_name(args.listkeggs)))
-        verbalise("G", "\n".join(genes))
+        for pathway in args.listkeggs.split(","):
+            # get all kegg orthologs from given pathway:
+            genes = kegg_tree.list_keggs(args.listkeggs, convert=False)
 
+            verbalise("M",
+                        "%d genes in pathway %s (%s)" %
+                            (   len(genes),
+                                args.listkeggs,
+                                kegg_tree.pathway_name(args.listkeggs)
+                            )
+                    )
+            verbalise("G", " ".join(genes))
+            verbalise("G",
+            "\n".join([ "%-8s %s" % (ko, kegg_tree.kegg_name(ko)) for ko in genes])
+                )
     if args.listpathways:
-        # get all pathways from given pathway group:
+        # get all pathways from given major pathway group:
         pathways = kegg_tree.list_pathways(args.listpathways)
-        verbalise("Y", "\n".join([ "%-8s %s" % (p, kegg_tree.pathway_name(p)) for p in pathways]))
+
+        # print with definition:
+        verbalise("Y",
+            "\n".join([ "%-8s %s" % (p, kegg_tree.pathway_name(p)) for p in pathways])
+                )
 
     if args.search:
-        results = kegg_tree.search_terms(args.search)
-        for level in results:
-            verbalise("M", level)
-            verbalise("C", "\n".join(results[level]))
+        print args.search.split(",")
+        for searchterm in args.search.split(","):
+            if searchterm == "":
+                continue
+            print searchterm
+            results = kegg_tree.search_terms(searchterm)
+            for level in results:
+                verbalise("M", level)
+                if level == "pathways":
+
+                    verbalise("Y",
+            "\n".join([ "%-8s %s" % (p, kegg_tree.pathway_name(p)) for p in results[level]])
+                        )
+                elif level == "keggs":
+                    verbalise("G",
+            "\n".join([ "%-8s %s" % (ko, kegg_tree.kegg_name(ko)) for ko in results[level]])
+                            )
+                else:
+                    verbalise("C", "\n".join(results[level]))
+
+    if args.define:
+        kos = args.define.split(',')
+        for ko in kos:
+            if ko == "":
+                continue
+
+            ko_def = kegg_tree.kegg_name(ko)
+            if ko in kegg_tree.pathways_rev:
+                higher_paths = kegg_tree.pathways_rev[ko]
+            else:
+                higher_paths = []
+            hp_defs =  [ kegg_tree.pathway_name(p) for p in higher_paths ]
+            hp_zip = zip(higher_paths, hp_defs)
+
+            verbalise("G",  "%-8s %s" % (ko, ko_def) )
+            verbalise("Y",  "\n".join(["%-8s %s" % (p, d) for p,d in hp_zip]))
+
 
