@@ -91,8 +91,6 @@ def assign(concordance=1):
     else:
         return '-'
 
-
-
 def make_genes(numgenes=7996, concordance=1):
     genelist = [ "%s%d" % (assign(concordance), i) for i in range(numgenes) ]
     return genelist
@@ -166,6 +164,67 @@ def graph_nos(nos, outfile, display=False, save=False, title=None):
     else:
         plt.close()
 
+def graph_final(all_values, outfile, display=False, save=False, title=None):
+    # create boxplot with overlapping individual data points
+    
+    annocoords = (1.05,np.mean(all_values)) 
+    annomeans  = "%.1f\n( +/- %.1f )" % (np.mean(all_values), np.std(all_values)) 
+
+    plt.figure(figsize=(5,4), facecolor='blue')    
+    plt.boxplot(all_values)
+    plt.scatter(1, np.mean(all_values), marker='*')
+    # annotate graph
+    if not title:
+        plt.title("Number of genes common to all overlapping sets")
+    else:
+        plt.title(title)
+    plt.ylabel('number of concordant DEGs')
+
+    plt.annotate(annomeans, xy=annocoords, xycoords='data',
+                xytext=(35, 0), textcoords='offset points',
+                horizontalalignment='left', verticalalignment='bottom',
+                )
+    # polish and publish
+    plt.tight_layout()
+    if save:
+        plt.savefig(outfile[:-3] + "png", format='png')
+    if display:
+        plt.show()
+    else:
+        plt.close()
+
+def report_all(outfile, all_values, significance_values):
+    handle = open(outfile, 'w')
+    for k in all_values.keys():
+        for s in [ int(r) for r in significance_values]:
+            pval = 1.0 * sum( 1 for x in all_values[k] if x >= s ) / len(all_values[k])
+            pval_str = "P-value for %d genes common to %d species is %.3f" % (s, k, pval)
+            verbalise("G", pval_str)
+            handle.write(pval_str + "\n")
+
+        distrib = "%.2f +/- %.2f [%d - %d]" % (np.mean(all_values[k]),
+                                                np.std(all_values[k]),
+                                                min(all_values[k]),
+                                                max(all_values[k]))
+        verbalise("Y", distrib)
+        handle.write(distrib + "\n")
+    handle.close()
+
+def report_final(outfile, all_values, significance_values, k):
+    handle = open(outfile, 'w')
+    for s in [ int(r) for r in significance_values]:
+        pval = 1.0 * sum( 1 for x in all_values if x >= s) / len(all_values)
+        pval_str = "P-value for %d genes common to %d species is %.3f" % (s, k, pval)
+        verbalise("G", pval_str)
+        handle.write(pval_str + "\n")
+
+        distrib = "%.2f +/- %.2f [%d - %d]" % (np.mean(all_values),
+                                                np.std(all_values),
+                                                min(all_values),
+                                                max(all_values))
+        verbalise("Y", distrib)
+        handle.write(distrib + "\n")
+    handle.close()
 
 ############################################################################
 
@@ -182,6 +241,7 @@ if __name__ == '__main__':
 
     means = {}
     everything = {}
+    final_count = []
     for iter in range(args.iterations):
         degs = {}
         # for each sample, create a genome and select the indicated number of
@@ -193,7 +253,8 @@ if __name__ == '__main__':
             degs[(i,numdegs)] = select_degs(
                                     genome,
                                     numdegs)
-
+        
+        # perform breakdown analysis:
         venn_values = find_overlaps(*degs.values())
         for k in venn_values:
             if k not in means:
@@ -209,7 +270,12 @@ if __name__ == '__main__':
                     logfile[:-4] + "_iter%d.png" % iter,
                     display=args.save_all and args.display_on,
                     save=args.save_all)
-
+        
+        # get final number of concordant DEGs:
+        common_degs = set.intersection(*[set(l) for l in degs.values()])
+        final_count.append(len(common_degs)) 
+        
+        
     verbalise("M", "stats for last genome generated:")
     verbalise("Y",
     "Genome size: %d\nNum DEGs: %d\nRatio + to -: %.3f\nFirst 10 genes:\n%s\n\n" % (len(genome),
@@ -219,24 +285,22 @@ if __name__ == '__main__':
 
 
     if args.significance:
-        outfile = logfile[:-3] + "pvalues.out"
-        handle = open(outfile, 'w')
-        for k in everything.keys():
-            for s in [ int(r) for r in args.significance.split(',')]:
-                pval = 1.0 * len([ x for x in everything[k] if x >= s]) / len(everything[k])
-                pval_str = "P-value for %d genes common to %d species is %.3f" % (s, k, pval)
-                verbalise("G", pval_str)
-                handle.write(pval_str + "\n")
-
-            range_str = "(Range: %d - %d)\n" % (min(everything[k]), max(everything[k]))
-            distrib = "%.2f +/- %.2f [%d - %d]" % (np.mean(everything[k]),
-                                                    np.std(everything[k]),
-                                                    min(everything[k]),
-                                                    max(everything[k]))
-            verbalise("Y", distrib)
-            handle.write(distrib + "\n")
-        handle.close()
-
+        report_all(logfile[:-3] + "subset_pvalues.out", 
+                    everything, 
+                    args.significance.split(','))
+        report_final(logfile[:-3] + "pvalues.out", 
+                    final_count, 
+                    args.significance.split(','), 
+                    k=len(args.degs.split(',')))
+    
+    # generate graphs:                
+    graph_final(final_count,
+                    logfile[:-4] + "all_concordant_iterations.png",
+                    display=args.display_on,
+                    save=True,
+                    title = "# concordant DEGs, %d spp\n(%d iterations, P(conc)=%.2f)" % (len(args.degs.split(',')),args.iterations, args.concordance))
+                    
+    
     graph_nos(means,
                     logfile[:-4] + "mean.png",
                     display=args.display_on,
@@ -256,5 +320,5 @@ if __name__ == '__main__':
                     display=args.display_on,
                     save=True,
                     title = "mean values of %d iterations" % args.iterations)
-
-
+    
+    
