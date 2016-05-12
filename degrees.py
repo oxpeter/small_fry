@@ -261,7 +261,8 @@ def draw_graph( con_sig1, con_nsig1, ncon_sig1, ncon_nsig1,
     else:
         plt.close()
 
-def draw_circles(c1t,c2t,c3t,c4t,o1t,o2t,o3t,o4t,l1t,l2t,l3t,l4t, outfile="venn.jpg", visible=False):
+def draw_circles(c1t,c2t,c3t,c4t,o1t,o2t,o3t,o4t,l1t,l2t,l3t,l4t,
+                    outfile="venn.jpg", visible=False):
     # define colors:
     burgundy =  (149,55,53)
     lightred =  (217,150,148)
@@ -321,23 +322,32 @@ def distance_tree(array, outfile, metric='euclidean', method='complete',
 
     verbalise("C", "%s" % (basis))
     verbalise(str(array))
+    verbalise("mean: %.3f" % array.mean().mean())
     print "\n"
 
     inverse = 1 / array
     zeroed  = inverse.fillna(0)
     Y  = distance.pdist(zeroed, metric)
     Z  = hierarchy.linkage(Y, method=method, metric=metric)
+    colors = ['black',] * 50
 
-    plt.figure(figsize=(10,7))
+    plt.figure(figsize=(10,7), facecolor='blue')
+
     hierarchy.dendrogram(Z,
-                        leaf_rotation=90.,
-                        leaf_font_size=8.,
-                        labels=array.columns)
+                        color_threshold=0,
+                        orientation='left',
+                        leaf_font_size=20,
+                        labels=array.columns,
+                        link_color_func=lambda k: colors[k])
     plt.title(
-        "Distances based on %s \n(%s distance tree, %s clustering)" % (
-                        basis, metric, method)
+        "Distances based on %s\n(%s distance tree, %s clustering)" % (
+                        basis, metric, method),
+            {'fontsize':15},
               )
-    plt.ylabel("Distance")
+    plt.xlabel("Distance")
+    plt.grid(b=False)
+    plt.tick_params(axis='x', which='major', direction='out')
+    plt.tight_layout()
     plt.savefig(outfile, format='pdf')
     if display:
         plt.show()
@@ -357,6 +367,93 @@ def pairwise_container(names, truncate=True):
                     )
 
     return df
+
+def enrichment(df3, ortho_idx, common_to_all):
+    """
+    Performs gene set enrichment using pfam domains for the orthologs common to all
+    species.
+    """
+    background_set_size = len(df3)
+    background_gene_set = { g[5:]:True for o in df3.index for g in ortho_idx[o]}
+    background_gene_set.update({ g:True for o in df3.index for g in ortho_idx[o]})
+
+
+    # create pfam indices:
+    pfam_idx = {}   # store all genes that contain a given pfam acc.
+    pfam_ref = {}   # store definitions of pfam accession numbers
+    pfam_acc = {}   # store all pfams for a given gene
+
+    handle = open(args.enrichment, 'rb')
+    for line in handle:
+        cols = line.split()
+
+        # skip all null lines:
+        if len(cols) == 0:
+            continue
+        elif line[0] == '#':
+            continue
+
+        # add to all the indices
+        if cols[1] not in pfam_ref:
+            pfam_ref[cols[1]] = " ".join(cols[22:])
+            pfam_idx[cols[1]] = []
+
+        if cols[3] not in pfam_acc:
+            pfam_acc[cols[3]] = []
+
+        pfam_idx[cols[1]].append(cols[3])
+        pfam_acc[cols[3]].append(cols[1])
+
+    handle.close()
+
+    ### create fisher squares for all concordant common orthologs:
+
+    # create key sets and counters:
+    common_pfams = set()
+    fs = [] # contains all the fishers tests
+
+    # collect all pfams in the CCOs:
+    deg_pfam_counter = collections.Counter()
+    for o in common_to_all:
+        for gene in ortho_idx[o]:
+            if gene[5:] in pfam_acc:
+                common_pfams.update(pfam_acc[gene[5:]])
+                deg_pfam_counter.update(set(pfam_acc[gene[5:]]))
+                break
+            elif gene in pfam_acc:
+                common_pfams.update(pfam_acc[gene])
+                deg_pfam_counter.update(set(pfam_acc[gene]))
+                break
+
+    # count occurrences of pfam in each category
+    for pfam in common_pfams:
+        degs_w_pfam  = deg_pfam_counter[pfam]
+        degs_wo_pfam = len(common_to_all) - degs_w_pfam
+        nogs_w_pfam  = sum( 1 for g in pfam_idx[pfam] if g in background_gene_set) - degs_w_pfam
+        nogs_wo_pfam = background_set_size - len(common_to_all) - nogs_w_pfam
+
+        fs.append(Fisher_square(TwG=degs_w_pfam,
+                                TwoG=degs_wo_pfam,
+                                NwG=nogs_w_pfam,
+                                NwoG=nogs_wo_pfam,
+                                id=pfam,
+                                id_info="%s (%s)" % (pfam, pfam_ref[pfam]) )
+                )
+
+    for s in fs:
+        s.fisher_test()
+    pvals = [ s.p for s in fs ]
+    fdr = p_to_q(pvals, alpha=0.05, method='fdr_bh')
+    verbalise("M", "%d pfam domains found in concordant common orthologs" % (len(fs)))
+
+    for s in fs:
+        if s.p in fdr:
+            if fdr[s.p] <= 0.05 and s.TwG > 1:
+                verbalise("C", s)
+                verbalise("M", "FDR = %.3f" % fdr[s.p])
+        elif s.p <= 0.05 and s.TwG > 1:
+            verbalise("C", s)
+            verbalise("M", "FDR not determined for P-value %r" % s.p)
 
 ########################################################################################
 
@@ -387,15 +484,15 @@ if __name__ == '__main__':
     else:
         necessary = None
 
-    verbalise("B", "\nFinding all orthologs containing:", " ".join(args.mustcontain))
-    verbalise("B", "and excluding:", " ".join(args.exclude))
+    verbalise("B", "\nFinding all orthologs containing:", " ".join(args.mustcontain.split(',')))
+    verbalise("B", "and excluding:", " ".join(args.exclude.split(',')))
     orthodic, ortho_idx = fetch_orthologs(args.orthologs[0],
                                             mustcontain=necessary,
                                             exclude=exclusions)
     verbalise("G", "%d genes were indexed in %d ortholog groups" % (len(orthodic),
                                                                     len(ortho_idx) ))
 
-    if len(args.experiments) > 2:
+    if len(args.experiments) > 1:
 
         ########################################################################
         ######## combine all experiments into single dataframe #################
@@ -403,7 +500,7 @@ if __name__ == '__main__':
         for num, exp in enumerate(args.experiments[1:]):
             dfnew = translate_to_orthologs(exp, orthodic)
             dfall = dfall.join(dfnew, how='left', rsuffix="_%d" % (num+1)).dropna()
-
+        
         verbalise("C", "%d orthologous groups meet selection criteria" % len(dfall))
         verbalise("M", "%d orthologs with >= 2 fold difference in at least 1 of %d species" %
                  (len(dfall[(dfall.logfc   >= 1.0) |(dfall.logfc   <= -1.0) | \
@@ -413,7 +510,7 @@ if __name__ == '__main__':
                             (dfall.logfc_4 >= 1.0) |(dfall.logfc_4 <= -1.0) | \
                             (dfall.logfc_5 >= 1.0) |(dfall.logfc_5 <= -1.0) ]),
                   len(args.experiments)) )
-        verbalise("M", "%d orthologs with negative >= 2 fold difference in %d species" %
+        verbalise("M", "%d orthologs with negative < 0 fold difference in %d species" %
                  (len(dfall[(dfall.logfc   < 0) & \
                             (dfall.logfc_1 < 0) & \
                             (dfall.logfc_2 < 0) & \
@@ -421,7 +518,8 @@ if __name__ == '__main__':
                             (dfall.logfc_4 < 0) & \
                             (dfall.logfc_5 < 0) ]),
                   len(args.experiments)) )
-        verbalise("M", "%d orthologs with positive >= 2 fold difference in %d species" %
+
+        verbalise("M", "%d orthologs with positive > 0 fold difference in %d species" %
                  (len(dfall[(dfall.logfc   > 0)  & \
                             (dfall.logfc_1 > 0)  & \
                             (dfall.logfc_2 > 0)  & \
@@ -430,6 +528,16 @@ if __name__ == '__main__':
                             (dfall.logfc_5 > 0)  ]),
                   len(args.experiments)) )
 
+        verbalise("M", "%d orthologs significant in at least one of %d species" %
+                 (len(dfall[(dfall.padj   <= 0.05) | \
+                            (dfall.padj_1 <= 0.05) | \
+                            (dfall.padj_2 <= 0.05) | \
+                            (dfall.padj_3 <= 0.05) | \
+                            (dfall.padj_4 <= 0.05) | \
+                            (dfall.padj_5 <= 0.05) ]),
+                  len(args.experiments)) )
+
+        
         names =  [ os.path.basename(e)[:5] for e in args.experiments ]
         cols = [ 'logfc' ] + [ 'logfc_%d' % e for e in range(1,len(args.experiments)) ]
         converter = dict(zip(cols, names))
@@ -469,6 +577,10 @@ if __name__ == '__main__':
         all_conc_array = pairwise_container(args.experiments)
         # for storing number of concordant genes significant in at least one species
         goodenough_array = pairwise_container(args.experiments)
+        # for concordance of at least one signif, scaled by number of DEGs
+        rel_conc_array = pairwise_container(args.experiments)
+        # for correlation of genes significant in at least on species of pair
+        good_correl_array = pairwise_container(args.experiments)
 
         concordant_sig_genesets = []
 
@@ -514,6 +626,7 @@ if __name__ == '__main__':
             # calculate various correlation metrics:
             correlation = df3['logfc'].corr(df3['logfc1st'], method='pearson')
 
+            # when fold change is high:
             high_expr = 1  #0.84799690655495  =log2(1.8)
             high_corr   = df3.loc[                                                 \
                             ((df3.logfc >= high_expr) | (df3.logfc <= -high_expr)) &     \
@@ -524,6 +637,12 @@ if __name__ == '__main__':
                                                     ((df3.logfc1st >= high_expr) |
                                                     (df3.logfc1st <= -high_expr)) \
                                                      ]['logfc1st'], method='pearson')
+
+            # significant genes in at least one of the pair:
+            onedeg_corr = df3.loc[(df3.padj <= 0.5) | (df3.padj1st <= 0.05)] \
+                                ['logfc'].corr(df3.loc[
+                                    (df3.padj <= 0.5) | (df3.padj1st <= 0.05)
+                                                      ]['logfc1st'], method='pearson')
 
             hsize = df3.loc[((df3.logfc >= high_expr)    | (df3.logfc <= -high_expr)) &  \
                             ((df3.logfc1st >= high_expr) | (df3.logfc1st <= -high_expr)) \
@@ -540,6 +659,7 @@ if __name__ == '__main__':
             high_correl_array[label1].loc[label2]   = high_corr
             bit_correl_array[label1].loc[label2]    = bit_corr
             diff_count_array[label1].loc[label2]    = hsize
+            good_correl_array[label1].loc[label2]   = onedeg_corr
 
             # get genes that are significant in both experiements and their direction:
             df1_sp = set(df3[(df3.padj1st<=0.05) & (df3.logfc1st>0)].index)
@@ -554,14 +674,19 @@ if __name__ == '__main__':
 
             # get number of genes concordantly expressed (significant or not)
             num_concord = len(df3[((df3.logfc1st > 0) & (df3.logfc > 0)) |
-                                  ((df3.logfc1st < 0) & (df3.logfc < 0))])
+                                  ((df3.logfc1st < 0) & (df3.logfc < 0))].index)
+
             all_conc_array[label1].loc[label2] = num_concord
 
             # get number of genes concordantly expressed (significant in at least one)
             num_close = len(df3[((df3.logfc1st > 0) & (df3.logfc > 0) |
-                                (df3.logfc1st > 0) & (df3.logfc > 0)) &
-                                ((df3.padj <= 0.05)  |  (df3.padj1st <= 0.05))])
+                                (df3.logfc1st < 0) & (df3.logfc < 0)) &
+                                ((df3.padj <= 0.05)  |  (df3.padj1st <= 0.05))].index)
             goodenough_array[label1].loc[label2] = num_close
+
+
+            num_sig = len(df3[(df3.padj <= 0.05) | (df3.padj1st <= 0.05)].index)
+            rel_conc_array[label1].loc[label2] = 1. * num_close / num_sig
 
             # find numbers of concordant and discordant genes:
             concordance_sets = concordancecounts(df1_sp, df2_sp, df1_sn, df2_sn,
@@ -570,8 +695,16 @@ if __name__ == '__main__':
             concordant_array[label1].loc[label2] = len(concordance_sets[0])
 
             # find inverse of jaccard's index for significant genes:
-            ijidx = 1. *(len(df1_sp | df1_sn) + len(df2_sp | df2_sn) - len(concordance_sets[0])) / \
-                    (len(df1_sp | df1_sn) + len(df2_sp | df2_sn) - 2 * len(concordance_sets[0]))
+            """
+            Jaccards distance is the dissimilarity between sets, and is calculated by:
+
+            (Union(AB) - Intersection(AB)) / Union(AB)
+
+
+            """
+            intersection_ab = 1. * len(df1_sp & df2_sp) + len(df1_sn & df2_sn)
+            union_ab     = num_sig
+            ijidx = union_ab / (union_ab - intersection_ab)
             jaccard_array[label1].loc[label2] = ijidx
 
 
@@ -649,7 +782,13 @@ if __name__ == '__main__':
                         basis="number of concordant genes, at least 1 significant",
                         display=args.display)
 
-
+        # calculate distance based on number of all concordant genes with >= 1 sig:
+        distance_tree(rel_conc_array,
+                        "%sall_concordant_gte1_sig_normalized_tree.pdf" % logfile[:-3],
+                        metric='euclidean',
+                        method='single',
+                        basis="number of concordant genes, at least 1 significant\nnormalised for number of DEGs",
+                        display=args.display)
 
         # calculate distance based on jaccard's index of DEGs:
         distance_tree(jaccard_array,
@@ -657,6 +796,14 @@ if __name__ == '__main__':
                         metric='euclidean',
                         method='single',
                         basis="Jaccard's index of DEGs",
+                        display=args.display)
+
+        # calculate distance based on correlation of log2foldchange, >=1 DEG
+        distance_tree(good_correl_array,
+                        "%slog2fc_gte1deg_correl_tree.pdf" % logfile[:-3],
+                        metric='euclidean',
+                        method='single',
+                        basis="correlation of log2(fold change), >= 1 DEG",
                         display=args.display)
 
         # calculate distance based on log2(fold change)
@@ -711,7 +858,7 @@ if __name__ == '__main__':
                 name_chart[cols[0]] = " ".join(cols[1:])
             handle.close()
 
-
+        handle = open("%s.common_genes.txt" % logfile[:-4], 'w')
         for o in common_to_all:
             name = "---"
             if args.name_genes:
@@ -719,93 +866,16 @@ if __name__ == '__main__':
                     for gene in ortho_idx[o]:
                         if gene[5:] in name_chart:
                             name = name_chart[gene[5:]]
-
+                            geneid = gene
             if name == "---":
-                name = "Includes: %s" % " ".join(ortho_idx[o][:3])
-            verbalise("Y", "%20s %s" % (o, name))
-
+                name = " ".join(ortho_idx[o][1:3])
+                geneid = ortho_idx[o][0]
+            result = "%-20s %-18s %s" % (o, geneid, name)
+            verbalise("Y", result)
+            handle.write("%s\n" % result)
 
     # perform Fisher's Exact Test for enrichment of Pfam domains in the orthologs that
     # were concordantly expressed in all pairwise comparisons
     if args.enrichment:
-        background_set_size = len(df3)
-        background_gene_set = { g[5:]:True for o in df3.index for g in ortho_idx[o]}
-        background_gene_set.update({ g:True for o in df3.index for g in ortho_idx[o]})
+        enrichment(df3, ortho_idx, common_to_all)
 
-
-        # create pfam indices:
-        pfam_idx = {}   # store all genes that contain a given pfam acc.
-        pfam_ref = {}   # store definitions of pfam accession numbers
-        pfam_acc = {}   # store all pfams for a given gene
-
-        handle = open(args.enrichment, 'rb')
-        for line in handle:
-            cols = line.split()
-
-            # skip all null lines:
-            if len(cols) == 0:
-                continue
-            elif line[0] == '#':
-                continue
-
-            # add to all the indices
-            if cols[1] not in pfam_ref:
-                pfam_ref[cols[1]] = " ".join(cols[22:])
-                pfam_idx[cols[1]] = []
-
-            if cols[3] not in pfam_acc:
-                pfam_acc[cols[3]] = []
-
-            pfam_idx[cols[1]].append(cols[3])
-            pfam_acc[cols[3]].append(cols[1])
-
-        handle.close()
-
-        ### create fisher squares for all concordant common orthologs:
-
-        # create key sets and counters:
-        common_pfams = set()
-        fs = [] # contains all the fishers tests
-
-        # collect all pfams in the CCOs:
-        deg_pfam_counter = collections.Counter()
-        for o in common_to_all:
-            for gene in ortho_idx[o]:
-                if gene[5:] in pfam_acc:
-                    common_pfams.update(pfam_acc[gene[5:]])
-                    deg_pfam_counter.update(set(pfam_acc[gene[5:]]))
-                    break
-                elif gene in pfam_acc:
-                    common_pfams.update(pfam_acc[gene])
-                    deg_pfam_counter.update(set(pfam_acc[gene]))
-                    break
-
-        # count occurrences of pfam in each category
-        for pfam in common_pfams:
-            degs_w_pfam  = deg_pfam_counter[pfam]
-            degs_wo_pfam = len(common_to_all) - degs_w_pfam
-            nogs_w_pfam  = sum( 1 for g in pfam_idx[pfam] if g in background_gene_set) - degs_w_pfam
-            nogs_wo_pfam = background_set_size - len(common_to_all) - nogs_w_pfam
-
-            fs.append(Fisher_square(TwG=degs_w_pfam,
-                                    TwoG=degs_wo_pfam,
-                                    NwG=nogs_w_pfam,
-                                    NwoG=nogs_wo_pfam,
-                                    id=pfam,
-                                    id_info="%s (%s)" % (pfam, pfam_ref[pfam]) )
-                    )
-
-        for s in fs:
-            s.fisher_test()
-        pvals = [ s.p for s in fs ]
-        fdr = p_to_q(pvals, alpha=0.05, method='fdr_bh')
-        verbalise("M", "%d pfam domains found in concordant common orthologs" % (len(fs)))
-
-        for s in fs:
-            if s.p in fdr:
-                if fdr[s.p] <= 0.05 and s.TwG > 1:
-                    verbalise("C", s)
-                    verbalise("M", "FDR = %.3f" % fdr[s.p])
-            elif s.p <= 0.05 and s.TwG > 1:
-                verbalise("C", s)
-                verbalise("M", "FDR not determined for P-value %r" % s.p)
