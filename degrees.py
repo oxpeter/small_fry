@@ -455,6 +455,20 @@ def enrichment(df3, ortho_idx, common_to_all):
             verbalise("C", s)
             verbalise("M", "FDR not determined for P-value %r" % s.p)
 
+def convert_name(o, ortho_idx, name_chart, namecheck=True):
+    name = "---"
+    if args.name_genes:
+        if o in ortho_idx:
+            for gene in ortho_idx[o]:
+                if gene[5:] in name_chart:
+                    name = name_chart[gene[5:]]
+                    geneid = gene
+    if name == "---":
+        name = " ".join(ortho_idx[o][1:3])
+        geneid = ortho_idx[o][0]
+    result = "%-20s %-18s %s" % (o, geneid, name)
+    return result
+
 ########################################################################################
 
 if __name__ == '__main__':
@@ -484,8 +498,10 @@ if __name__ == '__main__':
     else:
         necessary = None
 
-    verbalise("B", "\nFinding all orthologs containing:", " ".join(args.mustcontain.split(',')))
-    verbalise("B", "and excluding:", " ".join(args.exclude.split(',')))
+    if args.mustcontain:
+        verbalise("B", "\nFinding all orthologs containing:", " ".join(args.mustcontain.split(',')))
+    if args.exclude:
+        verbalise("B", "and not worrying about:", " ".join(args.exclude.split(',')))
     orthodic, ortho_idx = fetch_orthologs(args.orthologs[0],
                                             mustcontain=necessary,
                                             exclude=exclusions)
@@ -500,16 +516,21 @@ if __name__ == '__main__':
         for num, exp in enumerate(args.experiments[1:]):
             dfnew = translate_to_orthologs(exp, orthodic)
             dfall = dfall.join(dfnew, how='left', rsuffix="_%d" % (num+1)).dropna()
-        
+            log_label = "logfc_%s" % (num+1)
+            if args.calibrate and dfall[log_label].loc[args.calibrate] < 0:
+                dfall[log_label] = dfall[log_label] * -1
+
+
+
         verbalise("C", "%d orthologous groups meet selection criteria" % len(dfall))
         verbalise("M", "%d orthologs with >= 2 fold difference in at least 1 of %d species" %
                  (len(dfall[(dfall.logfc   >= 1.0) |(dfall.logfc   <= -1.0) | \
                             (dfall.logfc_1 >= 1.0) |(dfall.logfc_1 <= -1.0) | \
                             (dfall.logfc_2 >= 1.0) |(dfall.logfc_2 <= -1.0) | \
                             (dfall.logfc_3 >= 1.0) |(dfall.logfc_3 <= -1.0) | \
-                            (dfall.logfc_4 >= 1.0) |(dfall.logfc_4 <= -1.0) | \
-                            (dfall.logfc_5 >= 1.0) |(dfall.logfc_5 <= -1.0) ]),
+                            (dfall.logfc_4 >= 1.0) |(dfall.logfc_4 <= -1.0) ]),
                   len(args.experiments)) )
+
         verbalise("M", "%d orthologs with negative < 0 fold difference in %d species" %
                  (len(dfall[(dfall.logfc   < 0) & \
                             (dfall.logfc_1 < 0) & \
@@ -528,16 +549,29 @@ if __name__ == '__main__':
                             (dfall.logfc_5 > 0)  ]),
                   len(args.experiments)) )
 
-        verbalise("M", "%d orthologs significant in at least one of %d species" %
-                 (len(dfall[(dfall.padj   <= 0.05) | \
-                            (dfall.padj_1 <= 0.05) | \
-                            (dfall.padj_2 <= 0.05) | \
-                            (dfall.padj_3 <= 0.05) | \
-                            (dfall.padj_4 <= 0.05) | \
-                            (dfall.padj_5 <= 0.05) ]),
-                  len(args.experiments)) )
+        verbalise("M", "%d orthologs significant and concordant in all 5 spp" %
+                 (len(dfall[((dfall.padj  <= 0.05) & (dfall.logfc    < 0) & \
+                            (dfall.padj_1 <= 0.05) & (dfall.logfc_1  < 0) & \
+                            (dfall.padj_2 <= 0.05) & (dfall.logfc_2  < 0) & \
+                            (dfall.padj_3 <= 0.05) & (dfall.logfc_3  < 0) & \
+                            (dfall.padj_5 <= 0.05) & (dfall.logfc_5  < 0) & \
+                            (dfall.padj_4 <= 0.05) & (dfall.logfc_4  < 0)) | \
+                            ((dfall.padj  <= 0.05) & (dfall.logfc    > 0) & \
+                            (dfall.padj_1 <= 0.05) & (dfall.logfc_1  > 0) & \
+                            (dfall.padj_2 <= 0.05) & (dfall.logfc_2  > 0) & \
+                            (dfall.padj_3 <= 0.05) & (dfall.logfc_3  > 0) & \
+                            (dfall.padj_5 <= 0.05) & (dfall.logfc_5  > 0) & \
+                            (dfall.padj_4 <= 0.05) & (dfall.logfc_4  > 0))  \
+                            ]),
+                  ) )
 
-        
+        verbalise("Y", dfall[(dfall.padj  <= 0.05) &  \
+                            (dfall.padj_1 <= 0.05) &  \
+                            (dfall.padj_2 <= 0.05) &  \
+                            (dfall.padj_3 <= 0.05) &  \
+                            (dfall.padj_5 <= 0.05) &  \
+                            (dfall.padj_4 <= 0.05)  ][['logfc','logfc_1','logfc_2','logfc_3','logfc_4']])
+
         names =  [ os.path.basename(e)[:5] for e in args.experiments ]
         cols = [ 'logfc' ] + [ 'logfc_%d' % e for e in range(1,len(args.experiments)) ]
         converter = dict(zip(cols, names))
@@ -860,17 +894,8 @@ if __name__ == '__main__':
 
         handle = open("%s.common_genes.txt" % logfile[:-4], 'w')
         for o in common_to_all:
-            name = "---"
-            if args.name_genes:
-                if o in ortho_idx:
-                    for gene in ortho_idx[o]:
-                        if gene[5:] in name_chart:
-                            name = name_chart[gene[5:]]
-                            geneid = gene
-            if name == "---":
-                name = " ".join(ortho_idx[o][1:3])
-                geneid = ortho_idx[o][0]
-            result = "%-20s %-18s %s" % (o, geneid, name)
+            result = convert_name(o, ortho_idx, name_chart, args.name_genes)
+            
             verbalise("Y", result)
             handle.write("%s\n" % result)
 
