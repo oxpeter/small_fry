@@ -75,9 +75,39 @@ def define_arguments():
     parser.add_argument('-e', '--enrichment', type=str,
                         help="""provide a .obo file to perform GO term enrichment on the
                         common orthologs.""")
+    parser.add_argument('-G', '--globally', action='store_true',
+                        help="""perform analyses globally, looking at differences
+                        across all species at the same time""")
+    parser.add_argument('-P', '--pairwise', action='store_true',
+                        help="""perform pairwise analyses of each experiment, including
+                        linkage analysis and tree building""")
+    parser.add_argument('-K', '--keep_nas', action='store_true',
+                        help="""instead of removing all orthologs lacking data in any
+                        species, keep the nas. This will significantly change the
+                        analyses and their interpretations!""")
 
 
     return parser
+
+def global_dataframe(experiments, orthodic, calibrate=None, drop_nas=True):
+    """
+    Adds all log fold change, adjusted pvalues, and normalised mean expression values
+    to a single dataframe.
+    """
+    assert(len(experiments) > 1)
+    assert(isinstance(experiments, list))
+
+    dfall = translate_to_orthologs(experiments[0], orthodic)
+    for num, exp in enumerate(experiments[1:]):
+        dfnew = translate_to_orthologs(exp, orthodic)
+        dfall = dfall.join(dfnew, how='left', rsuffix="_%d" % (num+1))
+        log_label = "logfc_%s" % (num+1)
+        if calibrate and dfall[log_label].loc[calibrate] < 0:
+            dfall[log_label] = dfall[log_label] * -1
+
+        if drop_nas:
+            dfall = dfall.dropna()
+    return dfall
 
 def fetch_orthologs(orthofile, mustcontain=None, exclude=None):
     """
@@ -469,6 +499,482 @@ def convert_name(o, ortho_idx, name_chart, namecheck=True):
     result = "%-20s %-18s %s" % (o, geneid, name)
     return result
 
+def pairwise_comparisons(experiments, orthodic, calibrate=None, display=False,
+                         drop_nas=True):
+    ######## initialise containers ##############
+    # for storing pairwise shared DEGs:
+    concordant_array = pairwise_container(experiments)
+    # for storing pairwise correlation of log2(fold change):
+    correl_array = pairwise_container(experiments)
+    # for storing (inverse) jaccard's index of DEGs:
+    jaccard_array = pairwise_container(experiments)
+    # for storing correlation of highly differential genes:
+    high_correl_array = pairwise_container(experiments)
+    # for storing binary correlation of all genes:
+    bit_correl_array = pairwise_container(experiments)
+    # for storing number of common highly differential genes:
+    diff_count_array = pairwise_container(experiments)
+    # for storing number of concordant genes
+    all_conc_array = pairwise_container(experiments)
+    # for storing number of concordant genes significant in at least one species
+    goodenough_array = pairwise_container(experiments)
+    # for concordance of at least one signif, scaled by number of DEGs
+    rel_conc_array = pairwise_container(experiments)
+    # for correlation of genes significant in at least on species of pair
+    good_correl_array = pairwise_container(experiments)
+
+    concordant_sig_genesets = []
+
+    # for storing graphs and charts:
+    pdfhandle = PdfPages(logfile[:-3] + "barcharts.pdf")
+    all_pngs = []
+
+    for (exp1, exp2) in itertools.product(experiments, experiments):
+        """
+        itertools.product produces an all-by-all comparison of the two lists
+        because this will include the same file compared to itself, we need
+        to remove those cases (which would mess up our comparisons):
+        """
+        if exp1 == exp2:
+            continue
+
+        # get dataframes containing orthologs
+        df1 = translate_to_orthologs(exp1, orthodic)
+        df2 = translate_to_orthologs(exp2, orthodic)
+
+        # if ortholog group is provided for polarity calibration, make sure all
+        # changes for this ortholog are positive.
+        if calibrate and df1['logfc'].loc[calibrate] < 0:
+            df1.logfc = df1.logfc * -1
+        if calibrate and df2['logfc'].loc[calibrate] < 0:
+            df2.logfc = df2.logfc * -1
+
+        # calculate the ratio of positive to negative changes
+        p1 = df1[(df1.logfc > 0) & (df1.padj <= 0.05)].count()["logfc"]
+        n1 = df1[(df1.logfc < 0) & (df1.padj <= 0.05)].count()["logfc"]
+        r1 = 1. * p1 / (n1 + 1)
+
+        p2 = df2[(df2.logfc > 0) & (df2.padj <= 0.05)].count()["logfc"]
+        n2 = df2[(df2.logfc < 0) & (df2.padj <= 0.05)].count()["logfc"]
+        r2 = 1. * p2 / (n2 + 1)
+
+        # create merged dataset with only genes common to both species:
+        df3 = df1.join(df2, how='left', lsuffix="1st")
+        if drop_nas:
+            df3 = df3.dropna()
+
+        label1 = os.path.basename(exp1)[:5]
+        label2 = os.path.basename(exp2)[:5]
+
+        ######### analyse pairwise gene sets #######
+        # calculate various correlation metrics:
+        correlation = df3['logfc'].corr(df3['logfc1st'], method='pearson')
+
+        # when fold change is high:
+        high_expr = 1  #0.84799690655495  =log2(1.8)
+        high_corr   = df3.loc[ (
+                        (df3.logfc >= high_expr) | (df3.logfc <= -high_expr)
+                                ) &     \
+                                (
+                        (df3.logfc1st >= high_expr) | (df3.logfc1st <= -high_expr)
+                                ) \
+                        ]['logfc'].corr(df3.loc[(
+                                (df3.logfc >= high_expr) | (df3.logfc <= -high_expr)
+                                                 ) &
+                                                 (
+                                (df3.logfc1st >= high_expr) | (df3.logfc1st <= -high_expr)
+                                                 ) \
+                                                 ]['logfc1st'], method='pearson')
+
+
+        # significant genes in at least one of the pair:
+        onedeg_corr = df3.loc[(df3.padj <= 0.5) | (df3.padj1st <= 0.05)] \
+                            ['logfc'].corr(df3.loc[
+                                (df3.padj <= 0.5) | (df3.padj1st <= 0.05)
+                                                  ]['logfc1st'], method='pearson')
+
+        hsize = df3.loc[((df3.logfc >= high_expr)    | (df3.logfc <= -high_expr)) &  \
+                        ((df3.logfc1st >= high_expr) | (df3.logfc1st <= -high_expr)) \
+                        ].count()['logfc']
+
+
+        df3['bitfc'] = df3.apply(lambda x: x['logfc']/abs(x['logfc']), axis=1)
+        df3['bitfc1st'] = df3.apply(lambda x: x['logfc1st']/abs(x['logfc1st']), axis=1)
+
+        bit_corr    = df3['bitfc'].corr(df3['bitfc1st'], method='pearson')
+
+        # store correlation values in containers
+        correl_array[label1].loc[label2]        = correlation
+        high_correl_array[label1].loc[label2]   = high_corr
+        bit_correl_array[label1].loc[label2]    = bit_corr
+        diff_count_array[label1].loc[label2]    = hsize
+        good_correl_array[label1].loc[label2]   = onedeg_corr
+
+        # get genes that are significant in both experiements and their direction:
+        df1_sp = set(df3[(df3.padj1st<=0.05) & (df3.logfc1st>0)].index)
+        df2_sp = set(df3[(df3.padj   <=0.05) & (df3.logfc   >0)].index)
+        df1_sn = set(df3[(df3.padj1st<=0.05) & (df3.logfc1st<0)].index)
+        df2_sn = set(df3[(df3.padj   <=0.05) & (df3.logfc   <0)].index)
+
+        df1_nsp = set(df3[(df3.padj1st>0.05) & (df3.logfc1st>0)].index)
+        df2_nsp = set(df3[(df3.padj   >0.05) & (df3.logfc   >0)].index)
+        df1_nsn = set(df3[(df3.padj1st>0.05) & (df3.logfc1st<0)].index)
+        df2_nsn = set(df3[(df3.padj   >0.05) & (df3.logfc   <0)].index)
+
+        # get number of genes concordantly expressed (significant or not)
+        num_concord = len(df3[((df3.logfc1st > 0) & (df3.logfc > 0)) |
+                              ((df3.logfc1st < 0) & (df3.logfc < 0))].index)
+
+        all_conc_array[label1].loc[label2] = num_concord
+
+        # get number of genes concordantly expressed (significant in at least one)
+        num_close = len(df3[((df3.logfc1st > 0) & (df3.logfc > 0) |
+                            (df3.logfc1st < 0) & (df3.logfc < 0)) &
+                            ((df3.padj <= 0.05)  |  (df3.padj1st <= 0.05))].index)
+        goodenough_array[label1].loc[label2] = num_close
+
+        num_sig = len(df3[(df3.padj <= 0.05) | (df3.padj1st <= 0.05)].index)
+        rel_conc_array[label1].loc[label2] = 1. * num_close / num_sig
+
+        # find numbers of concordant and discordant genes:
+        concordance_sets = concordancecounts(df1_sp, df2_sp, df1_sn, df2_sn,
+                          df1_nsp, df2_nsp, df1_nsn, df2_nsn)
+        concordant_sig_genesets.append(concordance_sets[0])
+        concordant_array[label1].loc[label2] = len(concordance_sets[0])
+
+        # find inverse of jaccard's index for significant genes:
+        """
+        Jaccards distance is the dissimilarity between sets, and is calculated by:
+
+        (Union(AB) - Intersection(AB)) / Union(AB)
+
+
+        """
+        intersection_ab = 1. * len(df1_sp & df2_sp) + len(df1_sn & df2_sn)
+        union_ab     = num_sig
+        ijidx = union_ab / (union_ab - intersection_ab)
+        jaccard_array[label1].loc[label2] = ijidx
+
+        ########## report output ###################
+        verbalise("B",
+"%s (%d orthologs, er=%.1f) vs\n%s (%d orthologs, er=%.1f) : %d shared orthologs" % (
+                 label1.upper(), len(df1), r1,
+                 label2.upper(), len(df2), r2,
+                 len(df3))
+                  )
+        verbalise("G", "%s: %d significant and pos" % (label1, len(df1_sp)))
+        verbalise("G", "%s: %d significant and neg" % (label1, len(df1_sn)))
+        verbalise("G", "%s: %d all significant    " % (label1, len(df1_sp | df1_sn)))
+        verbalise("C", "%s: %d significant and pos" % (label2, len(df2_sp)))
+        verbalise("C", "%s: %d significant and neg" % (label2, len(df2_sn)))
+        verbalise("C", "%s: %d all significant    " % (label2, len(df2_sp | df2_sn)))
+        verbalise("Y", "concordant DEGs = ", len(concordance_sets[0]))
+        verbalise("M", "%d genes w log2fc > %d\n\n" % (hsize, high_expr))
+
+        # create graphs of overlapping DEGs:
+        scounts = sigcounts(df1_sp, df2_sp, df1_sn, df2_sn)
+        pos1_u,pos2_u,neg2_u,neg1_u,concord_p,discord_2p,concord_n,discord_1p = scounts
+
+        outpng = draw_circles(pos1_u, pos2_u,
+                    neg2_u, neg1_u,
+                    concord_p, discord_2p,
+                    concord_n, discord_1p,
+                    label1+" pos", label2+" pos", label1+" neg", label2+" neg",
+                    outfile= "%s%s_%s.venn.png" % (logfile[:-3],label1,label2 ),
+                    visible=display  )
+
+        all_pngs.append(outpng) # will be concatenated into a single pdf later.
+        concordance_sets = concordancecounts(df1_sp, df2_sp, df1_sn, df2_sn,
+                                             df1_nsp, df2_nsp, df1_nsn, df2_nsn)
+        draw_graph( *[len(s) for s in concordance_sets[:-1]],
+                    bkgd_freq=concordance_sets[-1],
+                    label1=label1, label2=label2,
+                    outfile=pdfhandle,
+                    visible=display )
+
+    # collate images, close output files and cleanup:
+    pdfhandle.close()
+
+    # convert is from the ImageMagick ubuntu install
+    status = subprocess.call(
+            ["convert"] + all_pngs + ["%svenn_diagrams.pdf" % logfile[:-3]]
+                            )
+    for f in all_pngs:
+        os.remove(f)
+
+    ########### SUMMARY OF ALL DATASETS ###########
+    common_to_all = set.intersection(*concordant_sig_genesets)
+
+    # calculate distance based on number of shared DEGs:
+    distance_tree(concordant_array,
+                    "%sdeg_tree.pdf" % logfile[:-3],
+                    metric='euclidean',
+                    method='single',
+                    basis="number of concordant DEGs",
+                    display=display)
+
+    # calculate distance based on number of all concordant genes:
+    distance_tree(all_conc_array,
+                    "%sall_concordant_tree.pdf" % logfile[:-3],
+                    metric='euclidean',
+                    method='single',
+                    basis="number of concordant genes",
+                    display=display)
+
+    # calculate distance based on number of all concordant genes with >= 1 sig:
+    distance_tree(goodenough_array,
+                    "%sall_concordant_gte1_sig_tree.pdf" % logfile[:-3],
+                    metric='euclidean',
+                    method='single',
+                    basis="number of concordant genes, at least 1 significant",
+                    display=display)
+
+    # calculate distance based on number of all concordant genes with >= 1 sig:
+    distance_tree(rel_conc_array,
+                    "%sall_concordant_gte1_sig_normalized_tree.pdf" % logfile[:-3],
+                    metric='euclidean',
+                    method='single',
+                    basis="number of concordant genes, at least 1 significant\nnormalised for number of DEGs",
+                    display=display)
+
+    # calculate distance based on jaccard's index of DEGs:
+    distance_tree(jaccard_array,
+                    "%sjaccards_tree.pdf" % logfile[:-3],
+                    metric='euclidean',
+                    method='single',
+                    basis="Jaccard's index of DEGs",
+                    display=display)
+
+    # calculate distance based on correlation of log2foldchange, >=1 DEG
+    distance_tree(good_correl_array,
+                    "%slog2fc_gte1deg_correl_tree.pdf" % logfile[:-3],
+                    metric='euclidean',
+                    method='single',
+                    basis="correlation of log2(fold change), >= 1 DEG",
+                    display=display)
+
+    # calculate distance based on log2(fold change)
+    distance_tree(correl_array,
+                    "%slog2fc_correl_tree.pdf" % logfile[:-3],
+                    metric='euclidean',
+                    method='single',
+                    basis="correlation of log2(fold change)",
+                    display=display)
+
+    # calculate distance based on log2(fold change) of highly expressed genes
+    distance_tree(high_correl_array,
+                    "%slog2fc_high_correl_tree.pdf" % logfile[:-3],
+                    metric='euclidean',
+                    method='single',
+                    basis="correlation of log2(fold change) of highly differential genes",
+                    display=display)
+
+    # calculate distance based on bitwise log2(fold change)
+    distance_tree(bit_correl_array,
+                    "%slog2fc_bit_correl_tree.pdf" % logfile[:-3],
+                    metric='euclidean',
+                    method='single',
+                    basis="correlation of bitwise log2(fold change)",
+                    display=display)
+
+    # calculate distance based on bitwise log2(fold change)
+    distance_tree(diff_count_array,
+                    "%slog2fc_highdiff_count_tree.pdf" % logfile[:-3],
+                    metric='euclidean',
+                    method='single',
+                    basis="number of common highly differential genes",
+                    display=display)
+
+
+    verbalise("R", "\nThere are %d genes common to all datasets" % len(common_to_all))
+    return common_to_all
+
+def global_comparisons(dfall, experiments, display=False):
+
+    # get orthologs that are positive and significant in all species:
+    sigpos      = (dfall['logfc'] > 0) & (dfall['padj'] <= 0.05)
+    for i in range(1, len(experiments)):
+        loglabel    = "logfc_%d" % i
+        plabel      = "padj_%d" % i
+        sigpos  = (dfall[loglabel] > 0) & (dfall[plabel] <= 0.05) & sigpos
+
+    # get orthologs that are negative and significant in all species:
+    signeg      = (dfall['logfc'] < 0) & (dfall['padj'] <= 0.05)
+    for i in range(1, len(experiments)):
+        loglabel    = "logfc_%d" % i
+        plabel      = "padj_%d" % i
+        signeg  = (dfall[loglabel] < 0) & (dfall[plabel] <= 0.05) & signeg
+
+    verbalise("G",
+        "%d orthologs positive and significant in all %d species" % (sigpos.sum(),
+                                                                        len(experiments)))
+    verbalise("M",
+        "%d orthologs negative and significant in all %d species" % (signeg.sum(),
+                                                                        len(experiments)))
+
+    # count number of species with values:
+    f = lambda x: x/3.
+    present = dfall.isnull().sum(axis=1).apply(lambda x: x/3.)
+    print present.tolist()[:100]
+    verbalise("C", present.sum(), "species/genes with missing values")
+
+    # get orthologs that are significant in all species:
+    sig      = (dfall['padj'] <= 0.05)
+    for i in range(1, len(experiments)):
+        loglabel    = "logfc_%d" % i
+        plabel      = "padj_%d" % i
+        sig  = (dfall[plabel] <= 0.05) & sig
+
+    # get orthologs that are negative in all species:
+    neg      = (dfall['logfc'] < 0)
+    for i in range(1, len(experiments)):
+        loglabel    = "logfc_%d" % i
+        plabel      = "padj_%d" % i
+        neg  = (dfall[loglabel] < 0) & neg
+
+    # get orthologs that are positive in all species:
+    pos      = (dfall['logfc'] > 0)
+    for i in range(1, len(experiments)):
+        loglabel    = "logfc_%d" % i
+        plabel      = "padj_%d" % i
+        pos  = (dfall[loglabel] > 0)  & pos
+
+    # get orthologs that are significant in at least one ("alo") species"
+    sig_alo      = (dfall['padj'] <= 0.05)
+    for i in range(1, len(experiments)):
+        loglabel    = "logfc_%d" % i
+        plabel      = "padj_%d" % i
+        sig_alo  = (dfall[plabel] <= 0.05) | sig_alo
+
+    # get orthologs that are negative in at least one ("alo") species:
+    neg_alo      = (dfall['logfc'] < 0)
+    for i in range(1, len(experiments)):
+        loglabel    = "logfc_%d" % i
+        plabel      = "padj_%d" % i
+        neg_alo  = (dfall[loglabel] < 0) | neg_alo
+
+    # get orthologs that are positive in at least one ("alo") species:
+    pos_alo      = (dfall['logfc'] > 0)
+    for i in range(1, len(experiments)):
+        loglabel    = "logfc_%d" % i
+        plabel      = "padj_%d" % i
+        pos_alo  = (dfall[loglabel] > 0)  | pos_alo
+
+    # get orthologs concordant in all species:
+    concordant = pos | neg
+
+    # get orthologs that have a two fold change in expression in at least one ("alo") species:
+    bigchange_alo      = (dfall['logfc'] >= 1) | (dfall['logfc'] <= -1)
+    for i in range(1, len(experiments)):
+        loglabel    = "logfc_%d" % i
+        plabel      = "padj_%d" % i
+        bigchange_alo  = (dfall[loglabel] >= 1) | (dfall[loglabel] <= -1) | bigchange_alo
+
+    # get orthologs that have a two fold change in expression in all species:
+    bigchange      = (dfall['logfc'] >= 1) | (dfall['logfc'] <= -1)
+    for i in range(1, len(experiments)):
+        loglabel    = "logfc_%d" % i
+        plabel      = "padj_%d" % i
+        bigchange_alo  = (dfall[loglabel] >= 1) | (dfall[loglabel] <= -1) & bigchange_alo
+
+    # values for at least one species:
+    verbalise("G",
+        "%d orthologs positive in at least one %d species" % (pos_alo.sum(), len(experiments)))
+    verbalise("M",
+        "%d orthologs negative in at least one %d species" % (neg_alo.sum(), len(experiments)))
+    verbalise("Y",
+        "%d orthologs significant in at least one %d species" % (sig_alo.sum(), len(experiments)))
+
+    print ''
+    # values for all species
+    verbalise("G",
+        "%d orthologs positive in all %d species" % (pos.sum(), len(experiments)))
+    verbalise("M",
+        "%d orthologs negative in all %d species" % (neg.sum(), len(experiments)))
+    verbalise("Y",
+        "%d orthologs significant in all %d species" % (sig.sum(), len(experiments)))
+
+    print ''
+    # combinations:
+    verbalise("G",
+        "%d orthologs positive and significant in all %d species" % (pos[sig==True].sum(),
+                     len(experiments)))
+    verbalise("M",
+        "%d orthologs negative and significant in all %d species" % (neg[sig==True].sum(),
+                     len(experiments)))
+
+
+
+    verbalise("C", "%d orthologs significant and concordant:" % concordant[sig].sum())
+    print dfall[concordant & sig][['logfc','logfc_1','logfc_2','logfc_3','logfc_4']]
+
+
+
+    verbalise("C", "%d orthologous groups meet selection criteria" % len(dfall))
+    verbalise("M", "%d orthologs with >= 2 fold difference in at least 1 of %d species" %
+             (len(dfall[(dfall.logfc   >= 1.0) |(dfall.logfc   <= -1.0) | \
+                        (dfall.logfc_1 >= 1.0) |(dfall.logfc_1 <= -1.0) | \
+                        (dfall.logfc_2 >= 1.0) |(dfall.logfc_2 <= -1.0) | \
+                        (dfall.logfc_3 >= 1.0) |(dfall.logfc_3 <= -1.0) | \
+                        (dfall.logfc_5 >= 1.0) |(dfall.logfc_5 <= -1.0) | \
+                        (dfall.logfc_4 >= 1.0) |(dfall.logfc_4 <= -1.0) ]),
+              len(experiments)) )
+
+    verbalise("M", "%d orthologs with negative < 0 fold difference in %d species" %
+             (len(dfall[(dfall.logfc   < 0) & \
+                        (dfall.logfc_1 < 0) & \
+                        (dfall.logfc_2 < 0) & \
+                        (dfall.logfc_3 < 0) & \
+                        (dfall.logfc_4 < 0) & \
+                        (dfall.logfc_5 < 0) ]),
+              len(experiments)) )
+
+    verbalise("M", "%d orthologs with positive > 0 fold difference in %d species" %
+             (len(dfall[(dfall.logfc   > 0)  & \
+                        (dfall.logfc_1 > 0)  & \
+                        (dfall.logfc_2 > 0)  & \
+                        (dfall.logfc_3 > 0)  & \
+                        (dfall.logfc_4 > 0)  & \
+                        (dfall.logfc_5 > 0)  ]),
+              len(experiments)) )
+
+    sig_and_concordant = dfall[((dfall.padj  <= 0.05) & (dfall.logfc    < 0) & \
+                        (dfall.padj_1 <= 0.05) & (dfall.logfc_1  < 0) & \
+                        (dfall.padj_2 <= 0.05) & (dfall.logfc_2  < 0) & \
+                        (dfall.padj_3 <= 0.05) & (dfall.logfc_3  < 0) & \
+                        (dfall.padj_5 <= 0.05) & (dfall.logfc_5  < 0) & \
+                        (dfall.padj_4 <= 0.05) & (dfall.logfc_4  < 0)) | \
+                        ((dfall.padj  <= 0.05) & (dfall.logfc    > 0) & \
+                        (dfall.padj_1 <= 0.05) & (dfall.logfc_1  > 0) & \
+                        (dfall.padj_2 <= 0.05) & (dfall.logfc_2  > 0) & \
+                        (dfall.padj_3 <= 0.05) & (dfall.logfc_3  > 0) & \
+                        (dfall.padj_5 <= 0.05) & (dfall.logfc_5  > 0) & \
+                        (dfall.padj_4 <= 0.05) & (dfall.logfc_4  > 0))  \
+                        ]
+    verbalise("M", "%d orthologs significant and concordant in all 5 spp" %
+             (len(sig_and_concordant),) )
+
+    verbalise("Y", sig_and_concordant[['logfc','logfc_1','logfc_2','logfc_3','logfc_4']])
+
+    names =  [ os.path.basename(e)[:5] for e in experiments ]
+    cols = [ 'logfc' ] + [ 'logfc_%d' % e for e in range(1,len(experiments)) ]
+    converter = dict(zip(cols, names))
+
+    special_array = pairwise_container(names, truncate=False)
+    for (exp1, exp2) in itertools.product(cols, repeat=2):
+        if exp1 == exp2:
+            continue
+        corr = dfall[exp1].corr(dfall[exp2], method='pearson')
+        special_array[converter[exp1]].loc[converter[exp2]] = corr
+
+    # calculate distance based on number of shared DEGs:
+    distance_tree(special_array,
+                    "%sspecial_tree.pdf" % logfile[:-3],
+                    metric='euclidean',
+                    method='single',
+                    basis="all genes with fold change >= 2",
+                    display=display)
+
 ########################################################################################
 
 if __name__ == '__main__':
@@ -505,387 +1011,40 @@ if __name__ == '__main__':
     orthodic, ortho_idx = fetch_orthologs(args.orthologs[0],
                                             mustcontain=necessary,
                                             exclude=exclusions)
+
     verbalise("G", "%d genes were indexed in %d ortholog groups" % (len(orthodic),
                                                                     len(ortho_idx) ))
 
     if len(args.experiments) > 1:
 
-        ########################################################################
-        ######## combine all experiments into single dataframe #################
-        dfall = translate_to_orthologs(args.experiments[0], orthodic)
-        for num, exp in enumerate(args.experiments[1:]):
-            dfnew = translate_to_orthologs(exp, orthodic)
-            dfall = dfall.join(dfnew, how='left', rsuffix="_%d" % (num+1)).dropna()
-            log_label = "logfc_%s" % (num+1)
-            if args.calibrate and dfall[log_label].loc[args.calibrate] < 0:
-                dfall[log_label] = dfall[log_label] * -1
+        ####### perform global analyses #################
+        if args.globally:
+            dfall = global_dataframe(args.experiments, orthodic,
+                                    calibrate=args.calibrate,
+                                    drop_nas=not(args.keep_nas))
+
+            verbalise("C", len(dfall.index), "orthologs added to table.")
+            global_comparisons(dfall, experiments=args.experiments, display=args.display)
 
 
-
-        verbalise("C", "%d orthologous groups meet selection criteria" % len(dfall))
-        verbalise("M", "%d orthologs with >= 2 fold difference in at least 1 of %d species" %
-                 (len(dfall[(dfall.logfc   >= 1.0) |(dfall.logfc   <= -1.0) | \
-                            (dfall.logfc_1 >= 1.0) |(dfall.logfc_1 <= -1.0) | \
-                            (dfall.logfc_2 >= 1.0) |(dfall.logfc_2 <= -1.0) | \
-                            (dfall.logfc_3 >= 1.0) |(dfall.logfc_3 <= -1.0) | \
-                            (dfall.logfc_4 >= 1.0) |(dfall.logfc_4 <= -1.0) ]),
-                  len(args.experiments)) )
-
-        verbalise("M", "%d orthologs with negative < 0 fold difference in %d species" %
-                 (len(dfall[(dfall.logfc   < 0) & \
-                            (dfall.logfc_1 < 0) & \
-                            (dfall.logfc_2 < 0) & \
-                            (dfall.logfc_3 < 0) & \
-                            (dfall.logfc_4 < 0) & \
-                            (dfall.logfc_5 < 0) ]),
-                  len(args.experiments)) )
-
-        verbalise("M", "%d orthologs with positive > 0 fold difference in %d species" %
-                 (len(dfall[(dfall.logfc   > 0)  & \
-                            (dfall.logfc_1 > 0)  & \
-                            (dfall.logfc_2 > 0)  & \
-                            (dfall.logfc_3 > 0)  & \
-                            (dfall.logfc_4 > 0)  & \
-                            (dfall.logfc_5 > 0)  ]),
-                  len(args.experiments)) )
-
-        verbalise("M", "%d orthologs significant and concordant in all 5 spp" %
-                 (len(dfall[((dfall.padj  <= 0.05) & (dfall.logfc    < 0) & \
-                            (dfall.padj_1 <= 0.05) & (dfall.logfc_1  < 0) & \
-                            (dfall.padj_2 <= 0.05) & (dfall.logfc_2  < 0) & \
-                            (dfall.padj_3 <= 0.05) & (dfall.logfc_3  < 0) & \
-                            (dfall.padj_5 <= 0.05) & (dfall.logfc_5  < 0) & \
-                            (dfall.padj_4 <= 0.05) & (dfall.logfc_4  < 0)) | \
-                            ((dfall.padj  <= 0.05) & (dfall.logfc    > 0) & \
-                            (dfall.padj_1 <= 0.05) & (dfall.logfc_1  > 0) & \
-                            (dfall.padj_2 <= 0.05) & (dfall.logfc_2  > 0) & \
-                            (dfall.padj_3 <= 0.05) & (dfall.logfc_3  > 0) & \
-                            (dfall.padj_5 <= 0.05) & (dfall.logfc_5  > 0) & \
-                            (dfall.padj_4 <= 0.05) & (dfall.logfc_4  > 0))  \
-                            ]),
-                  ) )
-
-        verbalise("Y", dfall[(dfall.padj  <= 0.05) &  \
-                            (dfall.padj_1 <= 0.05) &  \
-                            (dfall.padj_2 <= 0.05) &  \
-                            (dfall.padj_3 <= 0.05) &  \
-                            (dfall.padj_5 <= 0.05) &  \
-                            (dfall.padj_4 <= 0.05)  ][['logfc','logfc_1','logfc_2','logfc_3','logfc_4']])
-
-        names =  [ os.path.basename(e)[:5] for e in args.experiments ]
-        cols = [ 'logfc' ] + [ 'logfc_%d' % e for e in range(1,len(args.experiments)) ]
-        converter = dict(zip(cols, names))
-
-        special_array = pairwise_container(names, truncate=False)
-        for (exp1, exp2) in itertools.product(cols, repeat=2):
-            if exp1 == exp2:
-                continue
-            corr = dfall[exp1].corr(dfall[exp2], method='pearson')
-            special_array[converter[exp1]].loc[converter[exp2]] = corr
-
-        # calculate distance based on number of shared DEGs:
-        distance_tree(special_array,
-                        "%sspecial_tree.pdf" % logfile[:-3],
-                        metric='euclidean',
-                        method='single',
-                        basis="all genes with fold change >= 2",
-                        display=args.display)
-
-        #############################################
-        ######## do all pairwise comparisons ########
-
-        ######## initialise containers ##############
-        # for storing pairwise shared DEGs:
-        concordant_array = pairwise_container(args.experiments)
-        # for storing pairwise correlation of log2(fold change):
-        correl_array = pairwise_container(args.experiments)
-        # for storing (inverse) jaccard's index of DEGs:
-        jaccard_array = pairwise_container(args.experiments)
-        # for storing correlation of highly differential genes:
-        high_correl_array = pairwise_container(args.experiments)
-        # for storing binary correlation of all genes:
-        bit_correl_array = pairwise_container(args.experiments)
-        # for storing number of common highly differential genes:
-        diff_count_array = pairwise_container(args.experiments)
-        # for storing number of concordant genes
-        all_conc_array = pairwise_container(args.experiments)
-        # for storing number of concordant genes significant in at least one species
-        goodenough_array = pairwise_container(args.experiments)
-        # for concordance of at least one signif, scaled by number of DEGs
-        rel_conc_array = pairwise_container(args.experiments)
-        # for correlation of genes significant in at least on species of pair
-        good_correl_array = pairwise_container(args.experiments)
-
-        concordant_sig_genesets = []
-
-        # for storing graphs and charts:
-        pdfhandle = PdfPages(logfile[:-3] + "barcharts.pdf")
-        all_pngs = []
-
-        for (exp1, exp2) in itertools.product(args.experiments, args.experiments):
-            """
-            itertools.product produces an all-by-all comparison of the two lists
-            because this will include the same file compared to itself, we need
-            to remove those cases (which would mess up our comparisons):
-            """
-            if exp1 == exp2:
-                continue
-
-            # get dataframes containing orthologs
-            df1 = translate_to_orthologs(exp1, orthodic)
-            df2 = translate_to_orthologs(exp2, orthodic)
-
-            # if ortholog group is provided for polarity calibration, make sure all
-            # changes for this ortholog are positive.
-            if args.calibrate and df1['logfc'].loc[args.calibrate] < 0:
-                df1.logfc = df1.logfc * -1
-            if args.calibrate and df2['logfc'].loc[args.calibrate] < 0:
-                df2.logfc = df2.logfc * -1
-
-            # calculate the ratio of positive to negative changes
-            p1 = df1[(df1.logfc > 0) & (df1.padj <= 0.05)].count()["logfc"]
-            n1 = df1[(df1.logfc < 0) & (df1.padj <= 0.05)].count()["logfc"]
-            r1 = 1. * p1 / (n1 + 1)
-
-            p2 = df2[(df2.logfc > 0) & (df2.padj <= 0.05)].count()["logfc"]
-            n2 = df2[(df2.logfc < 0) & (df2.padj <= 0.05)].count()["logfc"]
-            r2 = 1. * p2 / (n2 + 1)
-
-            # create merged dataset with only genes common to both species:
-            df3 = df1.join(df2, how='left', lsuffix="1st").dropna()
-            label1 = os.path.basename(exp1)[:5]
-            label2 = os.path.basename(exp2)[:5]
-
-            ######### analyse pairwise gene sets #######
-            # calculate various correlation metrics:
-            correlation = df3['logfc'].corr(df3['logfc1st'], method='pearson')
-
-            # when fold change is high:
-            high_expr = 1  #0.84799690655495  =log2(1.8)
-            high_corr   = df3.loc[                                                 \
-                            ((df3.logfc >= high_expr) | (df3.logfc <= -high_expr)) &     \
-                            ((df3.logfc1st >= high_expr) | (df3.logfc1st <= -high_expr)) \
-                             ]['logfc'].corr(df3.loc[                              \
-                                                    ((df3.logfc >= high_expr) |
-                                                    (df3.logfc <= -high_expr) ) &  \
-                                                    ((df3.logfc1st >= high_expr) |
-                                                    (df3.logfc1st <= -high_expr)) \
-                                                     ]['logfc1st'], method='pearson')
-
-            # significant genes in at least one of the pair:
-            onedeg_corr = df3.loc[(df3.padj <= 0.5) | (df3.padj1st <= 0.05)] \
-                                ['logfc'].corr(df3.loc[
-                                    (df3.padj <= 0.5) | (df3.padj1st <= 0.05)
-                                                      ]['logfc1st'], method='pearson')
-
-            hsize = df3.loc[((df3.logfc >= high_expr)    | (df3.logfc <= -high_expr)) &  \
-                            ((df3.logfc1st >= high_expr) | (df3.logfc1st <= -high_expr)) \
-                            ].count()['logfc']
-
-
-            df3['bitfc'] = df3.apply(lambda x: x['logfc']/abs(x['logfc']), axis=1)
-            df3['bitfc1st'] = df3.apply(lambda x: x['logfc1st']/abs(x['logfc1st']), axis=1)
-
-            bit_corr    = df3['bitfc'].corr(df3['bitfc1st'], method='pearson')
-
-            # store correlation values in containers
-            correl_array[label1].loc[label2]        = correlation
-            high_correl_array[label1].loc[label2]   = high_corr
-            bit_correl_array[label1].loc[label2]    = bit_corr
-            diff_count_array[label1].loc[label2]    = hsize
-            good_correl_array[label1].loc[label2]   = onedeg_corr
-
-            # get genes that are significant in both experiements and their direction:
-            df1_sp = set(df3[(df3.padj1st<=0.05) & (df3.logfc1st>0)].index)
-            df2_sp = set(df3[(df3.padj   <=0.05) & (df3.logfc   >0)].index)
-            df1_sn = set(df3[(df3.padj1st<=0.05) & (df3.logfc1st<0)].index)
-            df2_sn = set(df3[(df3.padj   <=0.05) & (df3.logfc   <0)].index)
-
-            df1_nsp = set(df3[(df3.padj1st>0.05) & (df3.logfc1st>0)].index)
-            df2_nsp = set(df3[(df3.padj   >0.05) & (df3.logfc   >0)].index)
-            df1_nsn = set(df3[(df3.padj1st>0.05) & (df3.logfc1st<0)].index)
-            df2_nsn = set(df3[(df3.padj   >0.05) & (df3.logfc   <0)].index)
-
-            # get number of genes concordantly expressed (significant or not)
-            num_concord = len(df3[((df3.logfc1st > 0) & (df3.logfc > 0)) |
-                                  ((df3.logfc1st < 0) & (df3.logfc < 0))].index)
-
-            all_conc_array[label1].loc[label2] = num_concord
-
-            # get number of genes concordantly expressed (significant in at least one)
-            num_close = len(df3[((df3.logfc1st > 0) & (df3.logfc > 0) |
-                                (df3.logfc1st < 0) & (df3.logfc < 0)) &
-                                ((df3.padj <= 0.05)  |  (df3.padj1st <= 0.05))].index)
-            goodenough_array[label1].loc[label2] = num_close
-
-
-            num_sig = len(df3[(df3.padj <= 0.05) | (df3.padj1st <= 0.05)].index)
-            rel_conc_array[label1].loc[label2] = 1. * num_close / num_sig
-
-            # find numbers of concordant and discordant genes:
-            concordance_sets = concordancecounts(df1_sp, df2_sp, df1_sn, df2_sn,
-                              df1_nsp, df2_nsp, df1_nsn, df2_nsn)
-            concordant_sig_genesets.append(concordance_sets[0])
-            concordant_array[label1].loc[label2] = len(concordance_sets[0])
-
-            # find inverse of jaccard's index for significant genes:
-            """
-            Jaccards distance is the dissimilarity between sets, and is calculated by:
-
-            (Union(AB) - Intersection(AB)) / Union(AB)
-
-
-            """
-            intersection_ab = 1. * len(df1_sp & df2_sp) + len(df1_sn & df2_sn)
-            union_ab     = num_sig
-            ijidx = union_ab / (union_ab - intersection_ab)
-            jaccard_array[label1].loc[label2] = ijidx
-
-
-            ########## report output ###################
-            verbalise("B",
-    "\n\n%s (%d orthologs, er=%.1f) vs\n%s (%d orthologs, er=%.1f) : %d shared orthologs" % (
-                     label1.upper(), len(df1), r1,
-                     label2.upper(), len(df2), r2,
-                     len(df3))
-                      )
-            verbalise("G", "%s: %d significant and pos" % (label1, len(df1_sp)))
-            verbalise("G", "%s: %d significant and neg" % (label1, len(df1_sn)))
-            verbalise("G", "%s: %d all significant    " % (label1, len(df1_sp | df1_sn)))
-            verbalise("C", "%s: %d significant and pos" % (label2, len(df2_sp)))
-            verbalise("C", "%s: %d significant and neg" % (label2, len(df2_sn)))
-            verbalise("C", "%s: %d all significant    " % (label2, len(df2_sp | df2_sn)))
-            verbalise("Y", "concordant DEGs = ", len(concordance_sets[0]))
-            verbalise("M", "%d genes w log2fc > %d" % (hsize, high_expr))
-
-            # create graphs of overlapping DEGs:
-            scounts = sigcounts(df1_sp, df2_sp, df1_sn, df2_sn)
-            pos1_u,pos2_u,neg2_u,neg1_u,concord_p,discord_2p,concord_n,discord_1p = scounts
-
-            outpng = draw_circles(pos1_u, pos2_u,
-                        neg2_u, neg1_u,
-                        concord_p, discord_2p,
-                        concord_n, discord_1p,
-                        label1+" pos", label2+" pos", label1+" neg", label2+" neg",
-                        outfile= "%s%s_%s.venn.png" % (logfile[:-3],label1,label2 ),
-                        visible=args.display  )
-
-            all_pngs.append(outpng) # will be concatenated into a single pdf later.
-            concordance_sets = concordancecounts(df1_sp, df2_sp, df1_sn, df2_sn,
-                                                 df1_nsp, df2_nsp, df1_nsn, df2_nsn)
-            draw_graph( *[len(s) for s in concordance_sets[:-1]],
-                        bkgd_freq=concordance_sets[-1],
-                        label1=label1, label2=label2,
-                        outfile=pdfhandle,
-                        visible=args.display )
-
-        # collate images, close output files and cleanup:
-        pdfhandle.close()
-
-        # convert is from the ImageMagick ubuntu install
-        status = subprocess.call(
-                ["convert"] + all_pngs + ["%svenn_diagrams.pdf" % logfile[:-3]]
-                                )
-        for f in all_pngs:
-            os.remove(f)
-
-        ########### SUMMARY OF ALL DATASETS ###########
-        common_to_all = set.intersection(*concordant_sig_genesets)
-
-        # calculate distance based on number of shared DEGs:
-        distance_tree(concordant_array,
-                        "%sdeg_tree.pdf" % logfile[:-3],
-                        metric='euclidean',
-                        method='single',
-                        basis="number of concordant DEGs",
-                        display=args.display)
-
-        # calculate distance based on number of all concordant genes:
-        distance_tree(all_conc_array,
-                        "%sall_concordant_tree.pdf" % logfile[:-3],
-                        metric='euclidean',
-                        method='single',
-                        basis="number of concordant genes",
-                        display=args.display)
-
-        # calculate distance based on number of all concordant genes with >= 1 sig:
-        distance_tree(goodenough_array,
-                        "%sall_concordant_gte1_sig_tree.pdf" % logfile[:-3],
-                        metric='euclidean',
-                        method='single',
-                        basis="number of concordant genes, at least 1 significant",
-                        display=args.display)
-
-        # calculate distance based on number of all concordant genes with >= 1 sig:
-        distance_tree(rel_conc_array,
-                        "%sall_concordant_gte1_sig_normalized_tree.pdf" % logfile[:-3],
-                        metric='euclidean',
-                        method='single',
-                        basis="number of concordant genes, at least 1 significant\nnormalised for number of DEGs",
-                        display=args.display)
-
-        # calculate distance based on jaccard's index of DEGs:
-        distance_tree(jaccard_array,
-                        "%sjaccards_tree.pdf" % logfile[:-3],
-                        metric='euclidean',
-                        method='single',
-                        basis="Jaccard's index of DEGs",
-                        display=args.display)
-
-        # calculate distance based on correlation of log2foldchange, >=1 DEG
-        distance_tree(good_correl_array,
-                        "%slog2fc_gte1deg_correl_tree.pdf" % logfile[:-3],
-                        metric='euclidean',
-                        method='single',
-                        basis="correlation of log2(fold change), >= 1 DEG",
-                        display=args.display)
-
-        # calculate distance based on log2(fold change)
-        distance_tree(correl_array,
-                        "%slog2fc_correl_tree.pdf" % logfile[:-3],
-                        metric='euclidean',
-                        method='single',
-                        basis="correlation of log2(fold change)",
-                        display=args.display)
-
-        # calculate distance based on log2(fold change) of highly expressed genes
-        distance_tree(high_correl_array,
-                        "%slog2fc_high_correl_tree.pdf" % logfile[:-3],
-                        metric='euclidean',
-                        method='single',
-                        basis="correlation of log2(fold change) of highly differential genes",
-                        display=args.display)
-
-        # calculate distance based on bitwise log2(fold change)
-        distance_tree(bit_correl_array,
-                        "%slog2fc_bit_correl_tree.pdf" % logfile[:-3],
-                        metric='euclidean',
-                        method='single',
-                        basis="correlation of bitwise log2(fold change)",
-                        display=args.display)
-
-        # calculate distance based on bitwise log2(fold change)
-        distance_tree(diff_count_array,
-                        "%slog2fc_highdiff_count_tree.pdf" % logfile[:-3],
-                        metric='euclidean',
-                        method='single',
-                        basis="number of common highly differential genes",
-                        display=args.display)
-
-
-
-
-        verbalise("R", "\nThere are %d genes common to all datasets" % len(common_to_all))
-
+        ######## perform pairwise comparisons ########
+        if args.pairwise:
+            common_to_all = pairwise_comparisons(args.experiments,
+                                                orthodic=orthodic,
+                                                calibrate=args.calibrate,
+                                                display=args.display,
+                                                drop_nas=not(args.keep_nas) )
+        else:
+            common_to_all = None
     else:
         verbalise("R", "Insufficient output files were provided")
         sys.exit(1)
 
 
     # list all orthologs that were concordantly expressed in all pairwise comparisons:
-    if args.list_genes:
+    if args.list_genes and common_to_all:
+        name_chart = {}
         if args.name_genes:     # create dictionary for finding gene names
-            name_chart = {}
             handle = open(args.name_genes, 'rb')
             for line in handle:
                 cols = line.split()
@@ -895,7 +1054,7 @@ if __name__ == '__main__':
         handle = open("%s.common_genes.txt" % logfile[:-4], 'w')
         for o in common_to_all:
             result = convert_name(o, ortho_idx, name_chart, args.name_genes)
-            
+
             verbalise("Y", result)
             handle.write("%s\n" % result)
 
