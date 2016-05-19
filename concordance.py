@@ -166,11 +166,11 @@ def graph_nos(nos, outfile, display=False, save=False, title=None):
 
 def graph_final(all_values, outfile, display=False, save=False, title=None):
     # create boxplot with overlapping individual data points
-    
-    annocoords = (1.05,np.mean(all_values)) 
-    annomeans  = "%.1f\n( +/- %.1f )" % (np.mean(all_values), np.std(all_values)) 
 
-    plt.figure(figsize=(5,4), facecolor='blue')    
+    annocoords = (1.05,np.mean(all_values))
+    annomeans  = "%.1f\n( +/- %.1f )" % (np.mean(all_values), np.std(all_values))
+
+    plt.figure(figsize=(5,4), facecolor='blue')
     plt.boxplot(all_values)
     plt.scatter(1, np.mean(all_values), marker='*')
     # annotate graph
@@ -253,7 +253,7 @@ if __name__ == '__main__':
             degs[(i,numdegs)] = select_degs(
                                     genome,
                                     numdegs)
-        
+
         # perform breakdown analysis:
         venn_values = find_overlaps(*degs.values())
         for k in venn_values:
@@ -270,12 +270,12 @@ if __name__ == '__main__':
                     logfile[:-4] + "_iter%d.png" % iter,
                     display=args.save_all and args.display_on,
                     save=args.save_all)
-        
+
         # get final number of concordant DEGs:
         common_degs = set.intersection(*[set(l) for l in degs.values()])
-        final_count.append(len(common_degs)) 
-        
-        
+        final_count.append(len(common_degs))
+
+
     verbalise("M", "stats for last genome generated:")
     verbalise("Y",
     "Genome size: %d\nNum DEGs: %d\nRatio + to -: %.3f\nFirst 10 genes:\n%s\n\n" % (len(genome),
@@ -285,30 +285,30 @@ if __name__ == '__main__':
 
 
     if args.significance:
-        report_all(logfile[:-3] + "subset_pvalues.out", 
-                    everything, 
+        report_all(logfile[:-3] + "subset_pvalues.out",
+                    everything,
                     args.significance.split(','))
-        report_final(logfile[:-3] + "pvalues.out", 
-                    final_count, 
-                    args.significance.split(','), 
+        report_final(logfile[:-3] + "pvalues.out",
+                    final_count,
+                    args.significance.split(','),
                     k=len(args.degs.split(',')))
-    
-    # generate graphs:                
+
+    # generate graphs:
     graph_final(final_count,
-                    logfile[:-4] + "all_concordant_iterations.png",
+                    logfile[:-3] + "all_concordant_iterations.png",
                     display=args.display_on,
                     save=True,
                     title = "# concordant DEGs, %d spp\n(%d iterations, P(conc)=%.2f)" % (len(args.degs.split(',')),args.iterations, args.concordance))
-                    
-    
+
+
     graph_nos(means,
-                    logfile[:-4] + "mean.png",
+                    logfile[:-3] + "mean.png",
                     display=args.display_on,
                     save=True,
                     title = "mean (+/- SEM) number of concordant random DEGs \nfrom %d iterations, Pr(concordant)=%.2f" % (args.iterations, args.concordance))
 
     graph_nos(everything,
-                    logfile[:-4] + "all.png",
+                    logfile[:-3] + "all.png",
                     display=args.display_on,
                     save=True,
                     title = "all values of %d iterations" % args.iterations)
@@ -316,9 +316,9 @@ if __name__ == '__main__':
     fake_graph = dict.fromkeys(range(max(everything.keys())),[1])
     fake_graph[max(everything.keys())] = everything[max(everything.keys())]
     graph_nos(fake_graph,
-                    logfile[:-4] + "all_max_overlap.png",
+                    logfile[:-3] + "all_max_overlap.png",
                     display=args.display_on,
                     save=True,
                     title = "mean values of %d iterations" % args.iterations)
-    
-    
+
+
