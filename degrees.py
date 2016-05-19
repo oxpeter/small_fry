@@ -62,13 +62,20 @@ def define_arguments():
     parser.add_argument('-c', '--calibrate', type=str,
                         help="""provide an ortholog group name that is differentially
                         expressed in the same direction in all experiments, to ensure
-                        that all directionality is consisent across experiments.""")
+                        that all directionality is consisent across experiments. eg.
+                        'APR2016_00001325:'""")
 
     # analysis options
+    parser.add_argument("-f", "--filterby", type=str,
+                        help="""Will only include ortholog groups provided in this comma
+                        separated list.""")
     parser.add_argument("-L", "--list_genes", action='store_true',
                         help="""list all common significant genes.""")
     parser.add_argument('-n', '--name_genes', type=str,
                         help="""provide a file to convert gene loci to names.""")
+    parser.add_argument('-t', '--threshold', type=float, default=1.,
+                        help="""Any log2(fold change) values below this value will be
+                        excluded. [ default = 1 ]""")
     parser.add_argument("-A", "--findall", action='store_true',
                         help="""find all significant concordant genes between given
                         datasets""")
@@ -85,31 +92,43 @@ def define_arguments():
                         help="""instead of removing all orthologs lacking data in any
                         species, keep the nas. This will significantly change the
                         analyses and their interpretations!""")
+    parser.add_argument('--manage_duplicates', action='store_true',
+                        help="""instead of removing all orthologs when one member contains
+                        multiple genes, keep the ortholog group, but drop all instances
+                        of that species (will only make a difference if --keep_nas is
+                        also selected)""")
+    parser.add_argument('--heatmap', action='store_true',
+                        help="""plot hierarchical clustering of log2(fold change) of all
+                        samples.""")
 
 
     return parser
 
-def global_dataframe(experiments, orthodic, calibrate=None, drop_nas=True):
+def global_dataframe(experiments, orthodic, calibrate=None, drop_nas=True, filter=None,
+                    duplicates=False):
     """
     Adds all log fold change, adjusted pvalues, and normalised mean expression values
-    to a single dataframe.
+    to a single dataframe. Will then filter to include only orthologs given in filter list
     """
     assert(len(experiments) > 1)
     assert(isinstance(experiments, list))
 
-    dfall = translate_to_orthologs(experiments[0], orthodic)
+    dfall = translate_to_orthologs(experiments[0], orthodic, calibrate,
+            duplicates=duplicates)
     for num, exp in enumerate(experiments[1:]):
-        dfnew = translate_to_orthologs(exp, orthodic)
+        dfnew = translate_to_orthologs(exp, orthodic, calibrate, duplicates=duplicates)
         dfall = dfall.join(dfnew, how='left', rsuffix="_%d" % (num+1))
         log_label = "logfc_%s" % (num+1)
-        if calibrate and dfall[log_label].loc[calibrate] < 0:
-            dfall[log_label] = dfall[log_label] * -1
 
         if drop_nas:
             dfall = dfall.dropna()
+
+    if filter:
+        dfall = dfall.loc[filter]
+
     return dfall
 
-def fetch_orthologs(orthofile, mustcontain=None, exclude=None):
+def fetch_orthologs(orthofile, mustcontain=None, exclude=None, duplicates=False):
     """
     Uses orthomcl's mcl output file to collect all appropriate ortholog groups. The
     dictionary created will only add groups when all members of the 'mustcontain' list
@@ -136,7 +155,9 @@ def fetch_orthologs(orthofile, mustcontain=None, exclude=None):
             counts = collections.Counter()
             for g in cols:
                 spec = g.split('|')[0]
-                if spec in exclude:
+                if duplicates:
+                    counts[spec] = 1 # coerce to an acceptable number.
+                elif spec in exclude:
                     counts[spec] = 1 # coerce to an acceptable number.
                 else:
                     counts[spec] += 1
@@ -156,7 +177,7 @@ def fetch_orthologs(orthofile, mustcontain=None, exclude=None):
 
     return ortho_dic, ortho_idx
 
-def translate_to_orthologs(degfile, orthodic):
+def translate_to_orthologs(degfile, orthodic, calibrate=None, duplicates=False):
     """
     Takes the DESeq2 output file with genes, log2(fold change) and p-values, and
     creates a dictionary where the gene name is converted to the ortholog group name,
@@ -193,6 +214,13 @@ def translate_to_orthologs(degfile, orthodic):
     df = pd.DataFrame([ [k, v[0], v[1], v[2]] for k,v in degdic.items() ],
                         columns=["gene","padj","logfc","basemean"])
     indexed_df = df.set_index('gene')
+
+    if calibrate and indexed_df['logfc'].loc[calibrate] < 0:
+        indexed_df['logfc'] = indexed_df['logfc'] * -1
+
+    if duplicates:
+        indexed_df = indexed_df.drop_duplicates(keep=False)
+
     return indexed_df
 
 def sigcounts(pos1, pos2, neg1, neg2):
@@ -499,8 +527,8 @@ def convert_name(o, ortho_idx, name_chart, namecheck=True):
     result = "%-20s %-18s %s" % (o, geneid, name)
     return result
 
-def pairwise_comparisons(experiments, orthodic, calibrate=None, display=False,
-                         drop_nas=True):
+def pairwise_comparisons(experiments, orthodic, threshold=1, calibrate=None,
+                            display=False, drop_nas=True):
     ######## initialise containers ##############
     # for storing pairwise shared DEGs:
     concordant_array = pairwise_container(experiments)
@@ -571,30 +599,20 @@ def pairwise_comparisons(experiments, orthodic, calibrate=None, display=False,
         correlation = df3['logfc'].corr(df3['logfc1st'], method='pearson')
 
         # when fold change is high:
-        high_expr = 1  #0.84799690655495  =log2(1.8)
-        high_corr   = df3.loc[ (
-                        (df3.logfc >= high_expr) | (df3.logfc <= -high_expr)
-                                ) &     \
-                                (
-                        (df3.logfc1st >= high_expr) | (df3.logfc1st <= -high_expr)
-                                ) \
-                        ]['logfc'].corr(df3.loc[(
-                                (df3.logfc >= high_expr) | (df3.logfc <= -high_expr)
-                                                 ) &
-                                                 (
-                                (df3.logfc1st >= high_expr) | (df3.logfc1st <= -high_expr)
-                                                 ) \
+        high_expr = threshold  #0.84799690655495  =log2(1.8)
+        high_corr   = df3.loc[  (abs(df3.logfc) >= high_expr) | (abs(df3.logfc1st) >= high_expr) \
+                        ]['logfc'].corr(df3.loc[(abs(df3.logfc) >= high_expr) | \
+                                                (abs(df3.logfc1st) >= high_expr) \
                                                  ]['logfc1st'], method='pearson')
 
 
         # significant genes in at least one of the pair:
         onedeg_corr = df3.loc[(df3.padj <= 0.5) | (df3.padj1st <= 0.05)] \
                             ['logfc'].corr(df3.loc[
-                                (df3.padj <= 0.5) | (df3.padj1st <= 0.05)
+                                (df3.padj <= 0.5) | (df3.padj1st <= 0.05) \
                                                   ]['logfc1st'], method='pearson')
 
-        hsize = df3.loc[((df3.logfc >= high_expr)    | (df3.logfc <= -high_expr)) &  \
-                        ((df3.logfc1st >= high_expr) | (df3.logfc1st <= -high_expr)) \
+        hsize = df3.loc[(abs(df3.logfc) >= high_expr) & (abs(df3.logfc1st) >= high_expr)  \
                         ].count()['logfc']
 
 
@@ -789,55 +807,33 @@ def pairwise_comparisons(experiments, orthodic, calibrate=None, display=False,
     verbalise("R", "\nThere are %d genes common to all datasets" % len(common_to_all))
     return common_to_all
 
-def global_comparisons(dfall, experiments, display=False):
-
-    # get orthologs that are positive and significant in all species:
-    sigpos      = (dfall['logfc'] > 0) & (dfall['padj'] <= 0.05)
-    for i in range(1, len(experiments)):
-        loglabel    = "logfc_%d" % i
-        plabel      = "padj_%d" % i
-        sigpos  = (dfall[loglabel] > 0) & (dfall[plabel] <= 0.05) & sigpos
-
-    # get orthologs that are negative and significant in all species:
-    signeg      = (dfall['logfc'] < 0) & (dfall['padj'] <= 0.05)
-    for i in range(1, len(experiments)):
-        loglabel    = "logfc_%d" % i
-        plabel      = "padj_%d" % i
-        signeg  = (dfall[loglabel] < 0) & (dfall[plabel] <= 0.05) & signeg
-
-    verbalise("G",
-        "%d orthologs positive and significant in all %d species" % (sigpos.sum(),
-                                                                        len(experiments)))
-    verbalise("M",
-        "%d orthologs negative and significant in all %d species" % (signeg.sum(),
-                                                                        len(experiments)))
+def global_comparisons(dfall, experiments, threshold=1, display=False, outfile=None, ):
 
     # count number of species with values:
-    f = lambda x: x/3.
-    present = dfall.isnull().sum(axis=1).apply(lambda x: x/3.)
-    print present.tolist()[:100]
-    verbalise("C", present.sum(), "species/genes with missing values")
+    sp_threshold = len(experiments) - 1
+    missing = dfall.isnull().sum(axis=1).apply(lambda x: x/3.)
+    enough = missing.apply(lambda x: True if x<sp_threshold else False)
 
     # get orthologs that are significant in all species:
-    sig      = (dfall['padj'] <= 0.05)
+    sig      = (dfall['padj'] <= 0.05) | (dfall['padj'].isnull())
     for i in range(1, len(experiments)):
         loglabel    = "logfc_%d" % i
         plabel      = "padj_%d" % i
-        sig  = (dfall[plabel] <= 0.05) & sig
+        sig  = ((dfall[plabel] <= 0.05) | (dfall[plabel].isnull())) & sig
 
     # get orthologs that are negative in all species:
-    neg      = (dfall['logfc'] < 0)
+    neg      = (dfall['logfc'] < 0) | (dfall['logfc'].isnull())
     for i in range(1, len(experiments)):
         loglabel    = "logfc_%d" % i
         plabel      = "padj_%d" % i
-        neg  = (dfall[loglabel] < 0) & neg
+        neg  = ((dfall[loglabel] < 0) | (dfall[loglabel].isnull())) & neg
 
     # get orthologs that are positive in all species:
-    pos      = (dfall['logfc'] > 0)
+    pos      = (dfall['logfc'] > 0) | (dfall['logfc'].isnull())
     for i in range(1, len(experiments)):
         loglabel    = "logfc_%d" % i
         plabel      = "padj_%d" % i
-        pos  = (dfall[loglabel] > 0)  & pos
+        pos  = ((dfall[loglabel] > 0) | (dfall[loglabel].isnull()))  & pos
 
     # get orthologs that are significant in at least one ("alo") species"
     sig_alo      = (dfall['padj'] <= 0.05)
@@ -863,108 +859,68 @@ def global_comparisons(dfall, experiments, display=False):
     # get orthologs concordant in all species:
     concordant = pos | neg
 
-    # get orthologs that have a two fold change in expression in at least one ("alo") species:
-    bigchange_alo      = (dfall['logfc'] >= 1) | (dfall['logfc'] <= -1)
+    # get orthologs that have an x-fold change in expression in at least one ("alo") species:
+    bigchange_alo      = (dfall['logfc'] >= threshold) | (dfall['logfc'] <= -threshold)
     for i in range(1, len(experiments)):
         loglabel    = "logfc_%d" % i
         plabel      = "padj_%d" % i
-        bigchange_alo  = (dfall[loglabel] >= 1) | (dfall[loglabel] <= -1) | bigchange_alo
+        bigchange_alo  = (dfall[loglabel] >= threshold)  | \
+                         (dfall[loglabel] <= -threshold) | \
+                          bigchange_alo
 
-    # get orthologs that have a two fold change in expression in all species:
-    bigchange      = (dfall['logfc'] >= 1) | (dfall['logfc'] <= -1)
+    # get orthologs that have an x-fold change in expression in all species:
+    bigchange      =  (dfall['logfc'] >= threshold) | (dfall['logfc'] <= -threshold)  | \
+                        (dfall['logfc'].isnull())
     for i in range(1, len(experiments)):
         loglabel    = "logfc_%d" % i
         plabel      = "padj_%d" % i
-        bigchange_alo  = (dfall[loglabel] >= 1) | (dfall[loglabel] <= -1) & bigchange_alo
+        bigchange  = (  (dfall[loglabel] >= threshold)  |
+                        (dfall[loglabel] <= -threshold)  |
+                        (dfall[loglabel].isnull())  ) & bigchange
 
-    # values for at least one species:
-    verbalise("G",
-        "%d orthologs positive in at least one %d species" % (pos_alo.sum(), len(experiments)))
-    verbalise("M",
-        "%d orthologs negative in at least one %d species" % (neg_alo.sum(), len(experiments)))
-    verbalise("Y",
-        "%d orthologs significant in at least one %d species" % (sig_alo.sum(), len(experiments)))
+    #### RESULTS TABLE ######
+    lines = []
+    lines.append("%d species/genes with missing values" % missing.sum() )
+    lines.append("%d orthologs with >1 species" % enough.sum())
+    lines.append("\n")
+    lines.append("%-20s %10s %10s" % (" ","(>=1 spp)", "(all %d spp)" % len(experiments)))
+    lines.append("%-20s %10d %10d" % ("positive",pos_alo.sum(), pos[enough].sum()))
+    lines.append("%-20s %10d %10d" % ("negative",neg_alo.sum(), neg[enough].sum()))
+    lines.append("%-20s %10s %10d" % ("concordant","n/a",concordant[enough].sum()))
+    lines.append("%-20s %10s %10d" % ("positive and sig","n/a", pos[sig & enough].sum()))
+    lines.append("%-20s %10s %10d" % ("negative and sig","n/a", neg[sig & enough].sum()))
+    lines.append("%-20s %10s %10d" % ("sig and conc","n/a", sig[concordant & enough].sum()))
+    lines.append("%-20s %10d %10d" % ("significant",sig_alo.sum(), sig[enough].sum()))
+    lines.append("%-20s %10d %10d" % (">= %.2f fold diff" % 2**threshold,
+                                        bigchange_alo.sum(), bigchange[enough].sum()))
+    lines.append("%-20s %10s %10d" % ("positive and large","n/a",pos[bigchange & enough].sum()))
+    lines.append("%-20s %10s %10d" % ("negative and large","n/a",neg[bigchange & enough].sum()))
+    lines.append("%-20s %10s %10d" % ("concordant and large","n/a",
+                                        concordant[bigchange & enough].sum()))
 
-    print ''
-    # values for all species
-    verbalise("G",
-        "%d orthologs positive in all %d species" % (pos.sum(), len(experiments)))
-    verbalise("M",
-        "%d orthologs negative in all %d species" % (neg.sum(), len(experiments)))
-    verbalise("Y",
-        "%d orthologs significant in all %d species" % (sig.sum(), len(experiments)))
+    colours = ["C", "C", "", "", "G", "M", "C", "G", "M", "R", "Y", "C", "G", "M", "C", ]
 
-    print ''
-    # combinations:
-    verbalise("G",
-        "%d orthologs positive and significant in all %d species" % (pos[sig==True].sum(),
-                     len(experiments)))
-    verbalise("M",
-        "%d orthologs negative and significant in all %d species" % (neg[sig==True].sum(),
-                     len(experiments)))
+    for c,l in zip(colours, lines):
+        verbalise(c, l)
+    print "\n"
 
+    if outfile:
+        handle = open(outfile, 'w')
+        for l in lines:
+            handle.write("%s\n" % l)
+        handle.close()
 
-
-    verbalise("C", "%d orthologs significant and concordant:" % concordant[sig].sum())
-    print dfall[concordant & sig][['logfc','logfc_1','logfc_2','logfc_3','logfc_4']]
-
-
-
-    verbalise("C", "%d orthologous groups meet selection criteria" % len(dfall))
-    verbalise("M", "%d orthologs with >= 2 fold difference in at least 1 of %d species" %
-             (len(dfall[(dfall.logfc   >= 1.0) |(dfall.logfc   <= -1.0) | \
-                        (dfall.logfc_1 >= 1.0) |(dfall.logfc_1 <= -1.0) | \
-                        (dfall.logfc_2 >= 1.0) |(dfall.logfc_2 <= -1.0) | \
-                        (dfall.logfc_3 >= 1.0) |(dfall.logfc_3 <= -1.0) | \
-                        (dfall.logfc_5 >= 1.0) |(dfall.logfc_5 <= -1.0) | \
-                        (dfall.logfc_4 >= 1.0) |(dfall.logfc_4 <= -1.0) ]),
-              len(experiments)) )
-
-    verbalise("M", "%d orthologs with negative < 0 fold difference in %d species" %
-             (len(dfall[(dfall.logfc   < 0) & \
-                        (dfall.logfc_1 < 0) & \
-                        (dfall.logfc_2 < 0) & \
-                        (dfall.logfc_3 < 0) & \
-                        (dfall.logfc_4 < 0) & \
-                        (dfall.logfc_5 < 0) ]),
-              len(experiments)) )
-
-    verbalise("M", "%d orthologs with positive > 0 fold difference in %d species" %
-             (len(dfall[(dfall.logfc   > 0)  & \
-                        (dfall.logfc_1 > 0)  & \
-                        (dfall.logfc_2 > 0)  & \
-                        (dfall.logfc_3 > 0)  & \
-                        (dfall.logfc_4 > 0)  & \
-                        (dfall.logfc_5 > 0)  ]),
-              len(experiments)) )
-
-    sig_and_concordant = dfall[((dfall.padj  <= 0.05) & (dfall.logfc    < 0) & \
-                        (dfall.padj_1 <= 0.05) & (dfall.logfc_1  < 0) & \
-                        (dfall.padj_2 <= 0.05) & (dfall.logfc_2  < 0) & \
-                        (dfall.padj_3 <= 0.05) & (dfall.logfc_3  < 0) & \
-                        (dfall.padj_5 <= 0.05) & (dfall.logfc_5  < 0) & \
-                        (dfall.padj_4 <= 0.05) & (dfall.logfc_4  < 0)) | \
-                        ((dfall.padj  <= 0.05) & (dfall.logfc    > 0) & \
-                        (dfall.padj_1 <= 0.05) & (dfall.logfc_1  > 0) & \
-                        (dfall.padj_2 <= 0.05) & (dfall.logfc_2  > 0) & \
-                        (dfall.padj_3 <= 0.05) & (dfall.logfc_3  > 0) & \
-                        (dfall.padj_5 <= 0.05) & (dfall.logfc_5  > 0) & \
-                        (dfall.padj_4 <= 0.05) & (dfall.logfc_4  > 0))  \
-                        ]
-    verbalise("M", "%d orthologs significant and concordant in all 5 spp" %
-             (len(sig_and_concordant),) )
-
-    verbalise("Y", sig_and_concordant[['logfc','logfc_1','logfc_2','logfc_3','logfc_4']])
 
     names =  [ os.path.basename(e)[:5] for e in experiments ]
     cols = [ 'logfc' ] + [ 'logfc_%d' % e for e in range(1,len(experiments)) ]
     converter = dict(zip(cols, names))
 
+    # calculate pairwise correllation
     special_array = pairwise_container(names, truncate=False)
     for (exp1, exp2) in itertools.product(cols, repeat=2):
         if exp1 == exp2:
             continue
-        corr = dfall[exp1].corr(dfall[exp2], method='pearson')
+        corr = dfall[bigchange_alo][exp1].corr(dfall[bigchange_alo][exp2], method='pearson')
         special_array[converter[exp1]].loc[converter[exp2]] = corr
 
     # calculate distance based on number of shared DEGs:
@@ -972,8 +928,17 @@ def global_comparisons(dfall, experiments, display=False):
                     "%sspecial_tree.pdf" % logfile[:-3],
                     metric='euclidean',
                     method='single',
-                    basis="all genes with fold change >= 2",
+                    basis="correlation of all genes with fold change >= %.2f" % 2**threshold,
                     display=display)
+    print "\n"
+
+    # rename logfc labels for easier visualisation:
+    dfall.rename(columns=converter, inplace=True)
+
+    verbalise("C", "%d orthologs significant and concordant:" % concordant[sig & enough].sum())
+
+    print dfall[concordant & sig & enough][names]
+    return list(dfall[concordant & sig & enough].index), names
 
 ########################################################################################
 
@@ -1010,39 +975,68 @@ if __name__ == '__main__':
         verbalise("B", "and not worrying about:", " ".join(args.exclude.split(',')))
     orthodic, ortho_idx = fetch_orthologs(args.orthologs[0],
                                             mustcontain=necessary,
-                                            exclude=exclusions)
+                                            exclude=exclusions,
+                                            duplicates=args.manage_duplicates)
 
     verbalise("G", "%d genes were indexed in %d ortholog groups" % (len(orthodic),
                                                                     len(ortho_idx) ))
 
     if len(args.experiments) > 1:
-
+        orthologs = None
         ####### perform global analyses #################
+        if args.filterby:
+            filterlist = [ o.strip("""'" \t\n""") for o in args.filterby.split(',') ]
+        else:
+            filterlist = None
+
         if args.globally:
             dfall = global_dataframe(args.experiments, orthodic,
                                     calibrate=args.calibrate,
-                                    drop_nas=not(args.keep_nas))
+                                    drop_nas=not(args.keep_nas),
+                                    filter=filterlist,
+                                    duplicates=args.manage_duplicates)
 
             verbalise("C", len(dfall.index), "orthologs added to table.")
-            global_comparisons(dfall, experiments=args.experiments, display=args.display)
+            orthologs, lognames = global_comparisons(dfall,
+                                            threshold=args.threshold,
+                                            experiments=args.experiments,
+                                            display=args.display,
+                                            outfile="%sresults_summary.out" % logfile[:-3])
+
+            if args.heatmap:
+                if args.keep_nas:
+                    df = dfall[lognames].fillna(0)
+                else:
+                    df = dfall[lognames].dropna()
+
+                cmap = sns.cubehelix_palette(as_cmap=True, rot=-.3, light=1)
 
 
+
+
+                g = sns.clustermap(df, linewidths=.5,
+                                    method='single', metric='correlation')
+                plt.setp(g.ax_heatmap.yaxis.get_majorticklabels(), rotation=0)
+                plt.savefig(logfile[:-3] + "heatmap.pdf", format='pdf')
+                plt.show()
+
+                heatmap_orthologs = [ df.index[i] for i in g.dendrogram_row.reordered_ind ]
         ######## perform pairwise comparisons ########
         if args.pairwise:
-            common_to_all = pairwise_comparisons(args.experiments,
+            orthologs = pairwise_comparisons(args.experiments,
+                                                threshold=args.threshold,
                                                 orthodic=orthodic,
                                                 calibrate=args.calibrate,
                                                 display=args.display,
                                                 drop_nas=not(args.keep_nas) )
-        else:
-            common_to_all = None
+
     else:
         verbalise("R", "Insufficient output files were provided")
         sys.exit(1)
 
 
     # list all orthologs that were concordantly expressed in all pairwise comparisons:
-    if args.list_genes and common_to_all:
+    if args.list_genes and orthologs:
         name_chart = {}
         if args.name_genes:     # create dictionary for finding gene names
             handle = open(args.name_genes, 'rb')
@@ -1052,14 +1046,22 @@ if __name__ == '__main__':
             handle.close()
 
         handle = open("%s.common_genes.txt" % logfile[:-4], 'w')
-        for o in common_to_all:
+        for o in orthologs:
             result = convert_name(o, ortho_idx, name_chart, args.name_genes)
 
             verbalise("Y", result)
             handle.write("%s\n" % result)
 
+        print '\n\n%r' % orthologs
+
+        if args.heatmap:
+            verbalise("C", "\n\nHeatmap orthologs:")
+            for o in heatmap_orthologs:
+                result = convert_name(o, ortho_idx, name_chart, args.name_genes)
+                verbalise("Y", result)
+
     # perform Fisher's Exact Test for enrichment of Pfam domains in the orthologs that
     # were concordantly expressed in all pairwise comparisons
     if args.enrichment:
-        enrichment(df3, ortho_idx, common_to_all)
+        enrichment(df3, ortho_idx, orthologs)
 
